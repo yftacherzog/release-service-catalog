@@ -133,14 +133,17 @@ spec:
         - collect-data
     - name: verify-enterprise-contract
       taskRef:
-        resolver: "bundles"
-        params:
-          - name: bundle
-            value: $(params.verify_ec_task_bundle)
-          - name: kind
-            value: task
-          - name: name
-            value: verify-enterprise-contract
+        name: verify-enterprise-contract
+        kind: Task
+      # taskRef:
+      #   resolver: "bundles"
+      #   params:
+      #     - name: bundle
+      #       value: $(params.verify_ec_task_bundle)
+      #     - name: kind
+      #       value: task
+      #     - name: name
+      #       value: verify-enterprise-contract
       params:
         - name: IMAGES
           value: "$(workspaces.data.path)/$(tasks.collect-data.results.snapshotSpec)"
