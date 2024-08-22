@@ -18,6 +18,11 @@ Tekton pipeline to release Snapshots to an external registry.
 | verify_ec_task_bundle    | The location of the bundle containing the verify-enterprise-contract task                              | No       | -             |
 | taskGitUrl               | The url to the git repo where the release-service-catalog tasks to be used are stored                  | Yes      | https://github.com/konflux-ci/release-service-catalog.git |
 | taskGitRevision          | The revision in the taskGitUrl repo to be used                                                         | No       | -             |
+| caTrustConfigMapName | The name of the ConfigMap to read CA bundle data from                                                      | Yes      | trusted-ca    |
+| caTrustConfigMapKey  | The name of the key in the ConfigMap that contains the CA bundle data                                      | Yes      | ca-bundle.crt |
+
+## Changes in 5.1.0
+* pass custom CA cert location to push-snapshot task
 
 ## Changes in 5.0.0
 * Drop the `enterpriseContractPublicKey` param. The verify task will take the value from the policy.
