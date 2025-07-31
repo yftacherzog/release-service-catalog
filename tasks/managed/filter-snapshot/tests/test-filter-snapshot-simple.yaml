@@ -1,0 +1,319 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-filter-snapshot-simple
+spec:
+  description: |
+    Run the filter-snapshot task with mocked skopeo inspect results to test the filtering logic
+    without requiring actual container image inspection.
+  workspaces:
+    - name: tests-workspace
+  params:
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored.
+      type: string
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire.
+      type: string
+      default: "1d"
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: "--insecure"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable.
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+  tasks:
+    - name: setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      taskSpec:
+        results:
+          - name: sourceDataArtifact
+            type: string
+        workspaces:
+          - name: data
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          env:
+            - name: IMAGE_EXPIRES_AFTER
+              value: $(params.ociArtifactExpiresAfter)
+            - name: "ORAS_OPTIONS"
+              value: "$(params.orasOptions)"
+            - name: "DEBUG"
+              value: "$(params.trustedArtifactsDebug)"
+        steps:
+          - name: setup-values
+            image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+            script: |
+              #!/usr/bin/env sh
+              set -eux
+
+              mkdir -p "$(params.dataDir)/$(context.pipelineRun.uid)"
+              
+              # Create test snapshot with multiple components
+              cat > "$(params.dataDir)/$(context.pipelineRun.uid)/test_snapshot_spec.json" << EOF
+              {
+                "application": "testapp",
+                "components": [
+                  {
+                    "name": "squid",
+                    "containerImage": "quay.io/test/squid:latest",
+                    "source": {
+                      "git": {
+                        "revision": "test-rev",
+                        "url": "https://github.com/test/squid"
+                      }
+                    }
+                  },
+                  {
+                    "name": "squid-helm",
+                    "containerImage": "quay.io/test/squid-helm:latest",
+                    "source": {
+                      "git": {
+                        "revision": "test-rev",
+                        "url": "https://github.com/test/squid-helm"
+                      }
+                    }
+                  },
+                  {
+                    "name": "squid-tester",
+                    "containerImage": "quay.io/test/squid-tester:latest",
+                    "source": {
+                      "git": {
+                        "revision": "test-rev",
+                        "url": "https://github.com/test/squid-tester"
+                      }
+                    }
+                  }
+                ]
+              }
+              EOF
+
+              # Create test data file (empty for this test)
+              cat > "$(params.dataDir)/$(context.pipelineRun.uid)/test_data.json" << EOF
+              {}
+              EOF
+          - name: skip-trusted-artifact-operations
+            ref:
+              name: skip-trusted-artifact-operations
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: workDir
+                value: $(params.dataDir)
+          - name: create-trusted-artifact
+            ref:
+              name: create-trusted-artifact
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: workDir
+                value: $(params.dataDir)
+              - name: sourceDataArtifact
+                value: $(results.sourceDataArtifact.path)
+          - name: patch-source-data-artifact-result
+            ref:
+              name: patch-source-data-artifact-result
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: sourceDataArtifact
+                value: $(results.sourceDataArtifact.path)
+    - name: run-task
+      taskRef:
+        name: filter-snapshot
+      params:
+        - name: snapshotPath
+          value: $(context.pipelineRun.uid)/test_snapshot_spec.json
+        - name: dataPath
+          value: $(context.pipelineRun.uid)/test_data.json
+        - name: filters
+          value: |
+            [
+              {
+                "path": ".config.mediaType",
+                "value": "application/vnd.cncf.helm.config.v1+json"
+              },
+              {
+                "path": ".non.existing.path",
+                "value": "some-value"
+              }
+            ]
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: orasOptions
+          value: $(params.orasOptions)
+        - name: sourceDataArtifact
+          value: "$(tasks.setup.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: trustedArtifactsDebug
+          value: $(params.trustedArtifactsDebug)
+        - name: taskGitUrl
+          value: "http://localhost"
+        - name: taskGitRevision
+          value: "main"
+      runAfter:
+        - setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+    - name: check-result
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      params:
+        - name: sourceDataArtifact
+          value: "$(tasks.run-task.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: includedSnapshotPath
+          value: $(tasks.run-task.results.includedSnapshotPath)
+        - name: excludedSnapshotPath
+          value: $(tasks.run-task.results.excludedSnapshotPath)
+      runAfter:
+        - run-task
+      taskSpec:
+        workspaces:
+          - name: data
+        params:
+          - name: sourceDataArtifact
+            type: string
+          - name: dataDir
+            type: string
+          - name: includedSnapshotPath
+            type: string
+          - name: excludedSnapshotPath
+            type: string
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          env:
+            - name: IMAGE_EXPIRES_AFTER
+              value: $(params.ociArtifactExpiresAfter)
+            - name: "ORAS_OPTIONS"
+              value: "$(params.orasOptions)"
+            - name: "DEBUG"
+              value: "$(params.trustedArtifactsDebug)"
+        steps:
+          - name: skip-trusted-artifact-operations
+            ref:
+              name: skip-trusted-artifact-operations
+            params:
+              - name: ociStorage
+                value: $(params.ociStorage)
+              - name: workDir
+                value: $(params.dataDir)
+          - name: use-trusted-artifact
+            ref:
+              name: use-trusted-artifact
+            params:
+              - name: workDir
+                value: $(params.dataDir)
+              - name: sourceDataArtifact
+                value: $(params.sourceDataArtifact)
+          - name: check-result
+            image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              # Trim whitespace/newlines from includedSnapshotPath
+              read -r included_snapshot_file_path <<< "$(params.includedSnapshotPath)"
+              included_snapshot_file="$(params.dataDir)/$included_snapshot_file_path"
+              
+              echo "Checking included snapshot: $included_snapshot_file"
+              
+              # Test that the included snapshot file exists
+              if [ ! -f "$included_snapshot_file" ]; then
+                echo "Error: Included snapshot file not found: $included_snapshot_file"
+                exit 1
+              fi
+              
+              echo "Included snapshot file found successfully"
+              
+              # Test that the included snapshot contains the expected number of components
+              # Original had 3 components, we expect 2 after filtering out the Helm chart
+              component_count=$(jq -r '.components | length' "$included_snapshot_file")
+              echo "Included snapshot contains $component_count components"
+              
+                            # Test that squid component is still present
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid") ] | length' \
+                < "$included_snapshot_file"
+              )" -eq 1
+              
+              # Test that squid-tester component is still present
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid-tester") ] | length' \
+                < "$included_snapshot_file"
+              )" -eq 1
+              
+              # Test that squid-helm component was filtered out
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid-helm") ] | length' \
+                < "$included_snapshot_file"
+              )" -eq 0
+
+              echo "All tests passed successfully!" 
+          - name: check-excluded-result
+            image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              # Trim whitespace/newlines from excludedSnapshotPath
+              read -r excluded_snapshot_file_path <<< "$(params.excludedSnapshotPath)"
+              excluded_snapshot_file="$(params.dataDir)/$excluded_snapshot_file_path"
+
+              echo "Checking excluded snapshot: $excluded_snapshot_file"
+
+              # Test that the excluded snapshot file exists
+              if [ ! -f "$excluded_snapshot_file" ]; then
+                echo "Error: Excluded snapshot file not found: $excluded_snapshot_file"
+                exit 1
+              fi
+
+              echo "Excluded snapshot file found successfully"
+
+              # Test that the excluded snapshot contains the expected number of components
+              # We expect 1 component (squid-helm) to be excluded
+              component_count=$(jq -r '.components | length' "$excluded_snapshot_file")
+              echo "Excluded snapshot contains $component_count components"
+
+              # Test that squid-helm component is in the excluded snapshot
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid-helm") ] | length' \
+                < "$excluded_snapshot_file"
+              )" -eq 1
+
+              # Test that squid component is NOT in the excluded snapshot
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid") ] | length' \
+                < "$excluded_snapshot_file"
+              )" -eq 0
+
+              # Test that squid-tester component is NOT in the excluded snapshot
+              test "$(
+                jq -r '[ .components[] | select(.name=="squid-tester") ] | length' \
+                < "$excluded_snapshot_file"
+              )" -eq 0
+
+              echo "All excluded snapshot tests passed successfully!"

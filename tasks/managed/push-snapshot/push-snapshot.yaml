@@ -138,7 +138,7 @@ spec:
         - name: sourceDataArtifact
           value: $(params.sourceDataArtifact)
     - name: push-snapshot
-      image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+      image: quay.io/yftacherzog/release-service-utils:helm-cli
       computeResources:
         limits:
           memory: 1Gi
@@ -351,12 +351,12 @@ spec:
         # Create a temporary file for the pushes data to avoid command line argument length limits
         PUSHES_FILE=$(mktemp)
         jq -s . "$TMP_RESULTS_DIR"/*.json > "$PUSHES_FILE"
-        
+
         # Use file input instead of command line arguments to avoid argument length limits
         jq --slurpfile PUSHES "$PUSHES_FILE" '
           reduce $PUSHES[0][] as $p (.; (.images[] | select(.name == $p.name).urls) += [$p.url])
         ' "$RESULTS_JSON_FILE" | tee "$RESULTS_FILE"
-        
+
         # Clean up temporary files
         rm -f "$RESULTS_JSON_FILE" "$RESULTS_JSON_FILE.tmp" "$PUSHES_FILE"
 

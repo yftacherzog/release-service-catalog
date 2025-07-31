@@ -1,0 +1,268 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: reconstruct-snapshot
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to reconstruct a complete snapshot by merging included and excluded components.
+
+    This task takes the included snapshot (processed by push-snapshot) and the excluded snapshot
+    (processed by prepare-and-push-helm-chart) and creates a complete snapshot containing all
+    components with their final release information including Helm charts.
+
+    The reconstructed snapshot is suitable for use by update-cr-status task to populate
+    the release CR with complete artifact information.
+  params:
+    - name: includedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing included/mapped components (from filter-snapshot)
+    - name: excludedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing excluded components (from filter-snapshot)
+    - name: dataPath
+      type: string
+      description: Path to the data JSON file (for consistency with other tasks)
+    - name: resultsDirPath
+      type: string
+      description: Path to the results directory containing push-snapshot and helm chart results
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the OCI repository
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: dataDir
+      type: string
+      description: Path to the data directory
+      default: "/var/workdir"
+    - name: taskGitUrl
+      description: The git repository for the tasks
+      type: string
+      default: "https://github.com/konflux-ci/release-service-catalog.git"
+    - name: taskGitRevision
+      description: The git revision for the tasks
+      type: string
+      default: "main"
+  results:
+    - name: reconstructedSnapshotPath
+      description: Path to the reconstructed snapshot file containing all components
+    - name: sourceDataArtifact
+      description: Directory where data was extracted from the trusted artifact
+  workspaces:
+    - name: data
+      description: The workspace for data
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+  steps:
+    - name: skip-trusted-artifact-operations
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/skip-trusted-artifact-operations/skip-trusted-artifact-operations.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+
+    - name: use-trusted-artifact
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+
+    - name: reconstruct-snapshot
+      image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 512Mi
+          cpu: 100m
+      script: |
+        #!/usr/bin/env bash
+        set -ex
+
+        DATADIR="$(params.dataDir)"
+
+        # Handle both absolute and relative paths for the snapshot files
+        if [[ "$(params.includedSnapshotPath)" = /* ]]; then
+          included_snapshot_file="$(params.includedSnapshotPath)"
+        else
+          included_snapshot_file="$DATADIR/$(params.includedSnapshotPath)"
+        fi
+
+        if [[ "$(params.excludedSnapshotPath)" = /* ]]; then
+          excluded_snapshot_file="$(params.excludedSnapshotPath)"
+        else
+          excluded_snapshot_file="$DATADIR/$(params.excludedSnapshotPath)"
+        fi
+        results_dir="$DATADIR/$(params.resultsDirPath)"
+
+        echo "🔄 Reconstructing complete snapshot from included and excluded components"
+        echo "📋 Included snapshot: $included_snapshot_file"
+        echo "📋 Excluded snapshot: $excluded_snapshot_file"
+        echo "📋 Results directory: $results_dir"
+
+        # Verify input files exist
+        if [ ! -f "$included_snapshot_file" ]; then
+          echo "❌ Included snapshot file not found: $included_snapshot_file"
+          exit 1
+        fi
+
+        if [ ! -f "$excluded_snapshot_file" ]; then
+          echo "❌ Excluded snapshot file not found: $excluded_snapshot_file"
+          exit 1
+        fi
+
+        # Load snapshots
+        included_snapshot=$(cat "$included_snapshot_file")
+        excluded_snapshot=$(cat "$excluded_snapshot_file")
+
+        echo "📊 Included components: $(echo "$included_snapshot" | jq '.components | length')"
+        echo "📊 Excluded components: $(echo "$excluded_snapshot" | jq '.components | length')"
+
+        # Start with the included snapshot as the base
+        reconstructed_snapshot="$included_snapshot"
+
+        # Add excluded components back to the snapshot
+        # The excluded components may have been updated with Helm chart information
+        echo "🔄 Adding excluded components back to the snapshot..."
+
+        reconstructed_snapshot=$(echo "$reconstructed_snapshot" | jq \
+          --argjson excluded_components "$(echo "$excluded_snapshot" | jq '.components')" \
+          '.components += $excluded_components')
+
+        # Update excluded components with results from prepare-and-push-helm-chart if available
+        helm_results_file="$results_dir/prepare-and-push-helm-chart-results.json"
+        if [ -f "$helm_results_file" ]; then
+          echo "📋 Found Helm chart results, updating excluded components with chart information"
+
+          helm_charts=$(cat "$helm_results_file" | jq '.charts // []')
+          echo "📊 Helm charts found: $(echo "$helm_charts" | jq length)"
+
+          # For each Helm chart result, update the corresponding component
+          while IFS= read -r chart; do
+            chart_name=$(echo "$chart" | jq -r '.name')
+            chart_version=$(echo "$chart" | jq -r '.version')
+            chart_urls=$(echo "$chart" | jq -r '.urls[]')
+            chart_digest=$(echo "$chart" | jq -r '.shasum')
+
+            echo "🔄 Updating component with Helm chart info: $chart_name"
+
+            # Update the component in the reconstructed snapshot with Helm chart information
+            reconstructed_snapshot=$(echo "$reconstructed_snapshot" | jq \
+              --arg name "$chart_name" \
+              --arg version "$chart_version" \
+              --arg digest "$chart_digest" \
+              --argjson urls "$(echo "$chart" | jq '.urls')" \
+              '(.components[] | select(.name == $name)) += {
+                "helmChart": {
+                  "name": $name,
+                  "version": $version,
+                  "digest": $digest,
+                  "urls": $urls
+                }
+              }')
+          done < <(echo "$helm_charts" | jq -c '.[]')
+        else
+          echo "📋 No Helm chart results file found, excluded components unchanged"
+        fi
+
+        # Create the reconstructed snapshot file
+        reconstructed_snapshot_file="$DATADIR/$(params.resultsDirPath)/reconstructed_snapshot.json"
+        mkdir -p "$(dirname "$reconstructed_snapshot_file")"
+
+        echo "$reconstructed_snapshot" > "$reconstructed_snapshot_file"
+
+        echo "✅ Reconstructed snapshot created: $reconstructed_snapshot_file"
+        echo "📊 Total components in reconstructed snapshot: $(echo "$reconstructed_snapshot" | jq '.components | length')"
+
+        # Output results
+        echo -n "$(params.resultsDirPath)/reconstructed_snapshot.json" > "$(results.reconstructedSnapshotPath.path)"
+        echo -n "" > "$(results.sourceDataArtifact.path)"
+
+    - name: create-trusted-artifact
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: /tekton/results/sourceDataArtifact
+        - name: workDir
+          value: $(params.dataDir)
+
+    - name: patch-source-data-artifact-result
+      computeResources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 32Mi
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/patch-source-data-artifact-result/patch-source-data-artifact-result.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)
+  volumes:
+    - name: workdir
+      emptyDir: {}

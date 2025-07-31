@@ -1,0 +1,348 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: filter-snapshot
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to filter components from a snapshot based on skopeo inspect results.
+    
+    This task uses skopeo inspect to examine each component's container image and filters out
+    components that match the provided filter criteria. Filters can target any path within the
+    skopeo inspect result using JSONPath-like syntax.
+    
+    The task supports generic path-based filtering:
+    - Any JSON path within the skopeo inspect result
+    - Exact value matching
+    - Multiple filters per component (any match results in filtering)
+    
+    Example filter configuration:
+    [
+      {
+        "path": ".config.mediaType",
+        "value": "application/vnd.cncf.helm.config.v1+json"
+      },
+      {
+        "path": ".annotations.\"org.opencontainers.image.title\"",
+        "value": "squid-helm"
+      },
+      {
+        "path": ".annotations.\"org.opencontainers.image.version\"",
+        "value": "0.1.134+f2fccb1-on-pr"
+      }
+    ]
+  params:
+    - name: snapshotPath
+      type: string
+      description: Path to the snapshot JSON file to filter
+    - name: filters
+      type: string
+      description: JSON array of filter criteria to apply to snapshot components
+      default: "[]"
+    - name: dataPath
+      type: string
+      description: Path to the data JSON file (for consistency with other tasks)
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: $(workspaces.data.path)
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+  results:
+    - name: includedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing only the included artifacts
+    - name: excludedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing only the excluded artifacts
+    - name: sourceDataArtifact
+      type: string
+      description: Produced trusted data artifact
+  workspaces:
+    - name: data
+      description: The workspace where the snapshot and data JSON files reside
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+  steps:
+    - name: skip-trusted-artifact-operations
+      computeResources:
+        limits:
+          memory: 32Mi
+        requests:
+          memory: 32Mi
+          cpu: 20m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/skip-trusted-artifact-operations/skip-trusted-artifact-operations.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: filter-snapshot
+      image: quay.io/konflux-ci/release-service-utils:9089cafbf36bb889b4b73d8c2965613810f13736
+      computeResources:
+        limits:
+          memory: 256Mi
+        requests:
+          memory: 256Mi
+          cpu: 100m
+      script: |
+        #!/usr/bin/env bash
+        set -ex
+
+        # Load the snapshot
+        if [ ! -f "$(params.dataDir)/$(params.snapshotPath)" ]; then
+            echo "Snapshot file not found: $(params.dataDir)/$(params.snapshotPath)"
+            exit 1
+        fi
+
+        snapshot_file="$(params.dataDir)/$(params.snapshotPath)"
+        filters_json='$(params.filters)'
+        included_snapshot_file="$(params.dataDir)/$(params.snapshotPath).included"
+        excluded_snapshot_file="$(params.dataDir)/$(params.snapshotPath).excluded"
+
+        echo "Loading snapshot from: $snapshot_file"
+        echo "Applying filters: $filters_json"
+
+        # Parse the snapshot
+        snapshot=$(cat "$snapshot_file")
+        
+        # Check if filters are provided
+        if [ "$filters_json" = "[]" ] || [ "$filters_json" = "" ]; then
+            echo "No filters provided, copying original snapshot"
+            cp "$snapshot_file" "$included_snapshot_file"
+            # Create empty excluded snapshot
+            echo "$snapshot" | jq '.components = []' > "$excluded_snapshot_file"
+            echo -n "$(params.snapshotPath).included" > "$(results.includedSnapshotPath.path)"
+            echo -n "$(params.snapshotPath).excluded" > "$(results.excludedSnapshotPath.path)"
+            exit 0
+        fi
+
+        # Initialize included and excluded components arrays
+        included_components=()
+        excluded_components=()
+        total_components=0
+        filtered_count=0
+
+        # Process each component in the snapshot
+        components=$(echo "$snapshot" | jq -r '.spec.components // .components // []')
+        
+        if [ "$components" = "[]" ] || [ "$components" = "null" ]; then
+            echo "No components found in snapshot"
+            cp "$snapshot_file" "$included_snapshot_file"
+            # Create empty excluded snapshot
+            echo "$snapshot" | jq '.components = []' > "$excluded_snapshot_file"
+            echo -n "$(params.snapshotPath).included" > "$(results.includedSnapshotPath.path)"
+            echo -n "$(params.snapshotPath).excluded" > "$(results.excludedSnapshotPath.path)"
+            exit 0
+        fi
+
+        # Get component count
+        component_count=$(echo "$components" | jq 'length')
+        echo "Processing $component_count components"
+
+        # Process each component
+        for i in $(seq 0 $((component_count - 1))); do
+            component=$(echo "$components" | jq ".[$i]")
+            component_name=$(echo "$component" | jq -r '.name // "unknown"')
+            container_image=$(echo "$component" | jq -r '.containerImage // ""')
+            
+            total_components=$((total_components + 1))
+            
+            if [ -z "$container_image" ] || [ "$container_image" = "null" ]; then
+                echo "Component $component_name has no containerImage, keeping it"
+                filtered_components+=("$component")
+                continue
+            fi
+
+            echo "Inspecting component: $component_name ($container_image)"
+            
+            # Use skopeo inspect to get image metadata (same format as get-image-architectures)
+            if ! inspect_result=$(skopeo inspect --retry-times 3 --no-tags --raw "docker://$container_image" 2>/dev/null); then
+                echo "Warning: Failed to inspect $container_image, keeping component"
+                filtered_components+=("$component")
+                continue
+            fi
+
+            # Check if component matches any filter
+            should_remove=false
+            
+            # Parse each filter
+            filter_count=$(echo "$filters_json" | jq 'length')
+            for j in $(seq 0 $((filter_count - 1))); do
+                filter=$(echo "$filters_json" | jq ".[$j]")
+                filter_path=$(echo "$filter" | jq -r '.path // ""')
+                filter_value=$(echo "$filter" | jq -r '.value // ""')
+                
+                if [ -n "$filter_path" ] && [ -n "$filter_value" ]; then
+                    # Extract the actual value from the inspect result using the specified path
+                    actual_value=$(echo "$inspect_result" | jq -r "$filter_path // \"\"")
+                    
+                    if [ "$actual_value" = "$filter_value" ]; then
+                        echo "  Matches filter: $filter_path = $filter_value"
+                        should_remove=true
+                        break
+                    fi
+                else
+                    echo "  Warning: Invalid filter (missing path or value): $filter"
+                fi
+            done
+
+            if [ "$should_remove" = true ]; then
+                echo "  Removing component: $component_name"
+                excluded_components+=("$component")
+                filtered_count=$((filtered_count + 1))
+            else
+                echo "  Keeping component: $component_name"
+                included_components+=("$component")
+            fi
+        done
+
+        # Create included snapshot
+        if [ ${#included_components[@]} -eq 0 ]; then
+            # No components left, create empty components array
+            included_snapshot=$(echo "$snapshot" | jq '.components = []')
+        else
+            # Join included components and create new snapshot
+            components_json=$(printf '%s\n' "${included_components[@]}" | jq -s '.')
+            included_snapshot=$(echo "$snapshot" | jq --argjson components "$components_json" '.components = $components')
+        fi
+
+        # Create excluded snapshot
+        if [ ${#excluded_components[@]} -eq 0 ]; then
+            # No excluded components, create empty components array
+            excluded_snapshot=$(echo "$snapshot" | jq '.components = []')
+        else
+            # Join excluded components and create new snapshot
+            excluded_components_json=$(printf '%s\n' "${excluded_components[@]}" | jq -s '.')
+            excluded_snapshot=$(echo "$snapshot" | jq --argjson components "$excluded_components_json" '.components = $components')
+        fi
+
+                # Write included snapshot
+        echo "$included_snapshot" > "$included_snapshot_file"
+
+        # Write excluded snapshot
+        echo "$excluded_snapshot" > "$excluded_snapshot_file"
+        
+        echo "Filtering complete:"
+        echo "  Total components: $total_components"
+        echo "  Filtered out: $filtered_count"
+        echo "  Remaining: $((total_components - filtered_count))"
+        echo "  Included snapshot saved to: $included_snapshot_file"
+        echo "  Excluded snapshot saved to: $excluded_snapshot_file"
+
+        # Set results
+        echo -n "$(params.snapshotPath).included" > "$(results.includedSnapshotPath.path)"
+        echo -n "$(params.snapshotPath).excluded" > "$(results.excludedSnapshotPath.path)"
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 128Mi
+        requests:
+          memory: 128Mi
+          cpu: 250m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)
+    - name: patch-source-data-artifact-result
+      computeResources:
+        limits:
+          memory: 32Mi
+        requests:
+          memory: 32Mi
+          cpu: 20m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/patch-source-data-artifact-result/patch-source-data-artifact-result.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path) 

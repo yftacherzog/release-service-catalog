@@ -1,0 +1,264 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-reconstruct-snapshot
+spec:
+  description: |
+    Run the reconstruct-snapshot task with included and excluded snapshots and verify that
+    they are properly merged back together with Helm chart information.
+  workspaces:
+    - name: tests-workspace
+  params:
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored.
+      type: string
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire.
+      type: string
+      default: "1d"
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: "--insecure"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable.
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+  tasks:
+    - name: setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      taskSpec:
+        results:
+          - name: sourceDataArtifact
+            type: string
+        workspaces:
+          - name: data
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+          env:
+            - name: IMAGE_EXPIRES_AFTER
+              value: $(params.ociArtifactExpiresAfter)
+            - name: ORAS_OPTIONS
+              value: $(params.orasOptions)
+            - name: DEBUG
+              value: $(params.trustedArtifactsDebug)
+        steps:
+          - name: setup-test-data
+            image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+            script: |
+              #!/usr/bin/env bash
+              set -ex
+
+              # Create test directory structure
+              mkdir -p $(params.dataDir)/$(context.pipelineRun.uid)/results
+
+              # Create included snapshot (contains mapped container images)
+              cat > $(params.dataDir)/$(context.pipelineRun.uid)/included_snapshot.json << 'EOF'
+              {
+                "application": "test-app",
+                "components": [
+                  {
+                    "name": "app-server",
+                    "containerImage": "quay.io/test/app-server@sha256:abc123",
+                    "source": {
+                      "git": {
+                        "url": "https://github.com/test/app-server",
+                        "revision": "main"
+                      }
+                    }
+                  }
+                ]
+              }
+              EOF
+
+              # Create excluded snapshot (contains Helm chart component)
+              cat > $(params.dataDir)/$(context.pipelineRun.uid)/excluded_snapshot.json << 'EOF'
+              {
+                "application": "test-app",
+                "components": [
+                  {
+                    "name": "test-helm-chart",
+                    "containerImage": "quay.io/test/helm-chart@sha256:def456",
+                    "source": {
+                      "git": {
+                        "url": "https://github.com/test/helm-chart",
+                        "revision": "main"
+                      }
+                    }
+                  }
+                ]
+              }
+              EOF
+
+              # Create test data.json
+              cat > $(params.dataDir)/$(context.pipelineRun.uid)/data.json << 'EOF'
+              {
+                "application": "test-app",
+                "mapping": {
+                  "components": []
+                }
+              }
+              EOF
+
+              # Create Helm chart results file (simulating prepare-and-push-helm-chart output)
+              cat > $(params.dataDir)/$(context.pipelineRun.uid)/results/prepare-and-push-helm-chart-results.json << 'EOF'
+              {
+                "charts": [
+                  {
+                    "name": "test-helm-chart",
+                    "version": "1.0.0",
+                    "shasum": "sha256:helm123456789",
+                    "urls": ["oci://quay.io/test/helm-repo/test-helm-chart:1.0.0"],
+                    "repository": "quay.io/test/helm-repo"
+                  }
+                ]
+              }
+              EOF
+
+              echo -n "$(params.dataDir)" > $(results.sourceDataArtifact.path)
+    - name: run-task
+      taskRef:
+        name: reconstruct-snapshot
+      params:
+        - name: includedSnapshotPath
+          value: $(context.pipelineRun.uid)/included_snapshot.json
+        - name: excludedSnapshotPath
+          value: $(context.pipelineRun.uid)/excluded_snapshot.json
+        - name: dataPath
+          value: $(context.pipelineRun.uid)/data.json
+        - name: resultsDirPath
+          value: $(context.pipelineRun.uid)/results
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: orasOptions
+          value: $(params.orasOptions)
+        - name: sourceDataArtifact
+          value: "$(tasks.setup.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: trustedArtifactsDebug
+          value: $(params.trustedArtifactsDebug)
+        - name: taskGitUrl
+          value: "http://localhost"
+        - name: taskGitRevision
+          value: "main"
+      runAfter:
+        - setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+    - name: check-result
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      params:
+        - name: sourceDataArtifact
+          value: "$(tasks.run-task.results.sourceDataArtifact)=$(params.dataDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: reconstructedSnapshotPath
+          value: $(tasks.run-task.results.reconstructedSnapshotPath)
+      taskSpec:
+        params:
+          - name: sourceDataArtifact
+            type: string
+          - name: dataDir
+            type: string
+          - name: reconstructedSnapshotPath
+            type: string
+        workspaces:
+          - name: data
+        volumes:
+          - name: workdir
+            emptyDir: {}
+        stepTemplate:
+          volumeMounts:
+            - mountPath: /var/workdir
+              name: workdir
+        steps:
+          - name: check-reconstructed-snapshot
+            image: quay.io/konflux-ci/release-service-utils:ea7868ebdcc7a2116c620255034226611d837f42
+            script: |
+              #!/usr/bin/env bash
+              set -ex
+
+              echo "🔍 Checking reconstructed snapshot results..."
+
+              RECONSTRUCTED_SNAPSHOT_FILE="$(params.dataDir)/$(params.reconstructedSnapshotPath)"
+
+              echo "📋 Reconstructed snapshot file: $RECONSTRUCTED_SNAPSHOT_FILE"
+
+              # Verify the reconstructed snapshot file exists
+              if [ ! -f "$RECONSTRUCTED_SNAPSHOT_FILE" ]; then
+                echo "❌ Reconstructed snapshot file not found: $RECONSTRUCTED_SNAPSHOT_FILE"
+                exit 1
+              fi
+
+              echo "✅ Reconstructed snapshot file exists"
+
+              # Check the contents
+              echo "📊 Reconstructed snapshot contents:"
+              cat "$RECONSTRUCTED_SNAPSHOT_FILE" | jq .
+
+              # Verify it contains both included and excluded components
+              TOTAL_COMPONENTS=$(cat "$RECONSTRUCTED_SNAPSHOT_FILE" | jq '.components | length')
+              echo "📊 Total components in reconstructed snapshot: $TOTAL_COMPONENTS"
+
+              if [ "$TOTAL_COMPONENTS" != "2" ]; then
+                echo "❌ Expected 2 components in reconstructed snapshot, found: $TOTAL_COMPONENTS"
+                exit 1
+              fi
+
+              # Verify the app-server component exists
+              APP_SERVER_EXISTS=$(cat "$RECONSTRUCTED_SNAPSHOT_FILE" | jq '.components[] | select(.name == "app-server") | length')
+              if [ "$APP_SERVER_EXISTS" == "0" ]; then
+                echo "❌ app-server component not found in reconstructed snapshot"
+                exit 1
+              fi
+              echo "✅ app-server component found"
+
+              # Verify the test-helm-chart component exists
+              HELM_CHART_EXISTS=$(cat "$RECONSTRUCTED_SNAPSHOT_FILE" | jq '.components[] | select(.name == "test-helm-chart") | length')
+              if [ "$HELM_CHART_EXISTS" == "0" ]; then
+                echo "❌ test-helm-chart component not found in reconstructed snapshot"
+                exit 1
+              fi
+              echo "✅ test-helm-chart component found"
+
+              # Verify the Helm chart component has helmChart metadata
+              HELM_CHART_METADATA=$(cat "$RECONSTRUCTED_SNAPSHOT_FILE" | jq '.components[] | select(.name == "test-helm-chart") | .helmChart')
+              if [ "$HELM_CHART_METADATA" == "null" ]; then
+                echo "❌ Helm chart metadata not found in test-helm-chart component"
+                exit 1
+              fi
+              echo "✅ Helm chart metadata found"
+
+              # Verify Helm chart metadata content
+              HELM_CHART_NAME=$(echo "$HELM_CHART_METADATA" | jq -r '.name')
+              HELM_CHART_VERSION=$(echo "$HELM_CHART_METADATA" | jq -r '.version')
+
+              if [ "$HELM_CHART_NAME" != "test-helm-chart" ]; then
+                echo "❌ Expected Helm chart name 'test-helm-chart', found: $HELM_CHART_NAME"
+                exit 1
+              fi
+
+              if [ "$HELM_CHART_VERSION" != "1.0.0" ]; then
+                echo "❌ Expected Helm chart version '1.0.0', found: $HELM_CHART_VERSION"
+                exit 1
+              fi
+
+              echo "✅ All checks passed! Reconstructed snapshot is correct."
+      runAfter:
+        - run-task

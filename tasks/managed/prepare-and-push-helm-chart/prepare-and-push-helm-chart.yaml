@@ -1,0 +1,725 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: prepare-and-push-helm-chart
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    Tekton task to process excluded artifacts and extract Helm charts for pushing.
+
+    This task processes excluded artifacts from filter-snapshot task to extract Helm chart content.
+    For each artifact in the excluded snapshot, if it's a Helm chart (config.mediaType == application/vnd.cncf.helm.config.v1+json),
+    it pulls the artifact and extracts its content for further processing.
+  params:
+    - name: excludedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing excluded artifacts
+    - name: includedSnapshotPath
+      type: string
+      description: Path to the snapshot file containing included artifacts
+    - name: resultsDirPath
+      type: string
+      description: Path to the results directory containing push-snapshot results
+      default: ""
+    - name: dataPath
+      type: string
+      description: Path to the data JSON file containing ReleasePlanAdmission mapping
+      default: ""
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: $(workspaces.data.path)
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+      default: ""
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+      default: ""
+
+  workspaces:
+    - name: data
+      description: The workspace where the snapshot and data JSON files reside
+
+  results:
+    - name: processedHelmCharts
+      type: string
+      description: List of processed Helm chart artifacts
+    - name: sourceDataArtifact
+      type: string
+      description: Produced trusted data artifact
+
+  volumes:
+    - name: workdir
+      emptyDir: {}
+
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+
+  steps:
+    - name: skip-trusted-artifact-operations
+      computeResources:
+        limits:
+          memory: 32Mi
+        requests:
+          memory: 32Mi
+          cpu: 20m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/skip-trusted-artifact-operations/skip-trusted-artifact-operations.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: workDir
+          value: $(params.dataDir)
+
+    - name: use-trusted-artifact
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+        - name: workDir
+          value: $(params.dataDir)
+
+    - name: process-helm-charts
+      image: quay.io/yftacherzog/release-service-utils:helm-cli
+      computeResources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          memory: 256Mi
+      script: |
+        #!/usr/bin/env bash
+        set -eux
+
+        # Use the standard workdir mount point
+        DATADIR="$(params.dataDir)"
+
+        excluded_snapshot_file="$DATADIR/$(params.excludedSnapshotPath)"
+        included_snapshot_file="$DATADIR/$(params.includedSnapshotPath)"
+        push_results_file="$DATADIR/$(params.resultsDirPath)/push-snapshot-results.json"
+
+        # Load original snapshot (build-time images) and mapped snapshot (release-time images)
+        # In our pipeline: collect-data produces the original, apply-mapping creates the .orig backup
+        # and filter-snapshot produces the included/excluded snapshots
+        data_dir=$(dirname "$DATADIR/$(params.dataPath)")
+        original_snapshot_file="$data_dir/snapshot_spec.json.orig"
+        mapped_snapshot_file="$DATADIR/$(params.includedSnapshotPath)"
+
+        echo "Processing Helm charts from excluded snapshot: $excluded_snapshot_file"
+        echo "Included snapshot reference: $included_snapshot_file"
+        echo "Push results file: $push_results_file"
+        echo "Original snapshot file: $original_snapshot_file"
+        echo "Mapped snapshot file: $mapped_snapshot_file"
+
+        # Create build-to-release image mapping
+        build_to_release_mapping="{}"
+        helm_chart_repository=""
+
+        # Also check for included snapshot from filter-snapshot (contains mapped components)
+        included_snapshot_file="$DATADIR/$(params.includedSnapshotPath)"
+
+        if [ -f "$original_snapshot_file" ] && [ -f "$included_snapshot_file" ]; then
+          echo "📋 Creating build-to-release image mapping from included snapshot..."
+
+          # Create mapping from build-time to release-time repositories using included snapshot
+          # The included snapshot contains components that went through apply-mapping
+          build_to_release_mapping=$(jq -n '
+            ($original | .components) as $original_components |
+            ($included | .components) as $included_components |
+
+            reduce range(0; $original_components | length) as $i ({};
+              . + {
+                ($original_components[$i].containerImage): {
+                  "build_image": $original_components[$i].containerImage,
+                  "build_repo": ($original_components[$i].containerImage | split("@")[0]),
+                  "release_repo": ($included_components | map(select(.name == $original_components[$i].name)) | .[0].repository // ""),
+                  "component_name": $original_components[$i].name
+                }
+              }
+            )
+          ' \
+          --argjson original "$(cat "$original_snapshot_file")" \
+          --argjson included "$(cat "$included_snapshot_file")")
+
+        elif [ -f "$original_snapshot_file" ] && [ -f "$mapped_snapshot_file" ]; then
+          echo "📋 Creating build-to-release image mapping from mapped snapshot (fallback)..."
+
+          # Fallback: Create mapping from build-time to release-time repositories
+          build_to_release_mapping=$(jq -n '
+            ($original | .components) as $original_components |
+            ($mapped | .components) as $mapped_components |
+
+            reduce range(0; $original_components | length) as $i ({};
+              . + {
+                ($original_components[$i].containerImage): {
+                  "build_image": $original_components[$i].containerImage,
+                  "build_repo": ($original_components[$i].containerImage | split("@")[0]),
+                  "release_repo": ($mapped_components | map(select(.name == $original_components[$i].name)) | .[0].repository // ""),
+                  "component_name": $original_components[$i].name
+                }
+              }
+            )
+          ' \
+          --argjson original "$(cat "$original_snapshot_file")" \
+          --argjson mapped "$(cat "$mapped_snapshot_file")")
+        fi
+
+        echo "🔄 Build-to-release mapping created:"
+        echo "$build_to_release_mapping" | jq .
+
+        # Try to get Helm chart repository from ORIGINAL ReleasePlanAdmission data
+        # (not the processed data.json which gets filtered by apply-mapping)
+        # The collect-data task creates files in subdirectories, so we need to extract the subdirectory from dataPath
+        subdirectory=$(dirname "$(params.dataPath)")
+        release_plan_admission_file="$DATADIR/$subdirectory/release_plan_admission.json"
+        if [ -f "$release_plan_admission_file" ]; then
+          echo "📋 Looking for Helm chart repository in ORIGINAL ReleasePlanAdmission..."
+          echo "🔍 Debug: ReleasePlanAdmission file exists at: $release_plan_admission_file"
+
+          # Debug: Show the structure of the ReleasePlanAdmission file
+          echo "🔍 Debug: ReleasePlanAdmission spec.data keys:"
+          jq '.spec.data | keys' "$release_plan_admission_file" 2>/dev/null || echo "  (failed to parse ReleasePlanAdmission as JSON)"
+
+          echo "🔍 Debug: Mapping structure:"
+          jq '.spec.data.mapping' "$release_plan_admission_file" 2>/dev/null || echo "  (no .spec.data.mapping key found)"
+
+          echo "🔍 Debug: Available mapping components:"
+          jq '.spec.data.mapping.components[]? | .name' "$release_plan_admission_file" 2>/dev/null || echo "  (no .spec.data.mapping.components found)"
+
+          # Extract component name from excluded snapshot to find its repository mapping
+          excluded_component_name=$(cat "$excluded_snapshot_file" | jq -r '.components[0].name // ""' 2>/dev/null || echo "")
+          echo "🔍 Debug: Looking for component name: '$excluded_component_name'"
+
+          if [ -n "$excluded_component_name" ]; then
+            # Look for this component in the ORIGINAL ReleasePlanAdmission mapping
+            helm_chart_repository=$(jq -r --arg name "$excluded_component_name" \
+              '.spec.data.mapping.components[]? | select(.name == $name) | .repository // ""' \
+              "$release_plan_admission_file" 2>/dev/null || echo "")
+
+            echo "🔍 Debug: Repository lookup result: '$helm_chart_repository'"
+
+            if [ -n "$helm_chart_repository" ]; then
+              echo "✅ Found Helm chart repository in ORIGINAL ReleasePlanAdmission: $helm_chart_repository"
+            else
+              echo "⚠️  Helm chart component '$excluded_component_name' not found in ORIGINAL ReleasePlanAdmission mapping"
+              echo "ℹ️  The Helm chart component must be added to the ReleasePlanAdmission mapping to enable repository push"
+            fi
+          fi
+        else
+          echo "⚠️  ORIGINAL ReleasePlanAdmission file not found at: $release_plan_admission_file"
+
+          # Fallback: try the processed data file (though it might be filtered)
+          data_file="$DATADIR/$(params.dataPath)"
+          if [ -f "$data_file" ]; then
+            echo "📋 Fallback: Looking for Helm chart repository in processed data file..."
+            echo "🔍 Debug: Data file exists at: $data_file"
+
+            # Extract component name from excluded snapshot to find its repository mapping
+            excluded_component_name=$(cat "$excluded_snapshot_file" | jq -r '.components[0].name // ""' 2>/dev/null || echo "")
+            echo "🔍 Debug: Looking for component name: '$excluded_component_name'"
+
+            if [ -n "$excluded_component_name" ]; then
+              # Look for this component in the processed data mapping (likely filtered out)
+              helm_chart_repository=$(jq -r --arg name "$excluded_component_name" \
+                                  '.mapping.components[]? | select(.name == $name) | .repository // ""' \
+                "$data_file" 2>/dev/null || echo "")
+
+              echo "🔍 Debug: Repository lookup result from processed data: '$helm_chart_repository'"
+
+              if [ -n "$helm_chart_repository" ]; then
+                echo "✅ Found Helm chart repository in processed data: $helm_chart_repository"
+              else
+                echo "⚠️  Helm chart component '$excluded_component_name' not found in processed data (expected - it was filtered out)"
+              fi
+            fi
+          else
+            echo "❌ Neither ReleasePlanAdmission nor data file found"
+          fi
+        fi
+
+        # Load push results if available
+        push_results="{}"
+        if [ -f "$push_results_file" ]; then
+          push_results=$(cat "$push_results_file")
+          echo "📋 Loaded push-snapshot results with $(echo "$push_results" | jq '.images | length') pushed components"
+        else
+          echo "⚠️  Push results file not found - will not have registry destination info"
+        fi
+
+        if [ ! -f "$excluded_snapshot_file" ]; then
+          echo "Warning: Excluded snapshot file not found: $excluded_snapshot_file"
+          echo -n "[]" > "$(results.processedHelmCharts.path)"
+          exit 0
+        fi
+
+        excluded_snapshot=$(cat "$excluded_snapshot_file")
+        components=$(echo "$excluded_snapshot" | jq -r '.components // []')
+
+        if [ "$components" = "[]" ] || [ "$components" = "null" ]; then
+          echo "No components found in excluded snapshot"
+          echo -n "[]" > "$(results.processedHelmCharts.path)"
+          exit 0
+        fi
+
+        component_count=$(echo "$components" | jq length)
+        echo "Processing $component_count excluded components"
+
+        processed_charts=[]
+
+        # Initialize array to store chart results for release CR status
+        chart_results=[]
+
+        for i in $(seq 0 $((component_count - 1))); do
+          component=$(echo "$components" | jq ".[$i]")
+          component_name=$(echo "$component" | jq -r '.name // "unknown"')
+          container_image=$(echo "$component" | jq -r '.containerImage // ""')
+
+          echo "Processing component: $component_name ($container_image)"
+
+          # Get registry destination and digest info from push results
+          registry_destinations=[]
+          pushed_digest=""
+          if [ "$push_results" != "{}" ]; then
+            # Find matching component in push results
+            push_info=$(echo "$push_results" | jq --arg name "$component_name" '.images[] | select(.name == $name) // empty')
+            if [ -n "$push_info" ] && [ "$push_info" != "null" ]; then
+              registry_destinations=$(echo "$push_info" | jq '.urls // []')
+              pushed_digest=$(echo "$push_info" | jq -r '.shasum // ""')
+              echo "  📦 Registry destinations: $(echo "$registry_destinations" | jq -r '. | join(", ")')"
+              echo "  🔍 Pushed digest: $pushed_digest"
+            else
+              echo "  ⚠️  No push results found for component: $component_name"
+            fi
+          fi
+
+          if [ -z "$container_image" ] || [ "$container_image" = "null" ]; then
+            echo "  Skipping component without container image"
+            continue
+          fi
+
+          echo "  Inspecting artifact with skopeo..."
+
+          # Inspect the container image to determine if it's a Helm chart
+          set +x  # Temporarily disable debug output
+          inspect_result=$(skopeo inspect --retry-times 3 --no-tags --raw "docker://$container_image" 2>&1)
+          set -x  # Re-enable debug output
+          if [ $? -ne 0 ]; then
+            echo "  ❌ Failed to inspect $container_image"
+            echo "  🔍 Error details: $inspect_result"
+            continue
+          fi
+
+          media_type=$(echo "$inspect_result" | jq -r '.config.mediaType // ""')
+          echo "  Media type: $media_type"
+
+          if [ "$media_type" = "application/vnd.cncf.helm.config.v1+json" ]; then
+            echo "  ✅ Found Helm chart: $component_name"
+
+            # Extract Helm chart content
+            echo "  📦 Extracting Helm chart content..."
+
+            # Create temporary directory for extraction
+            extract_dir=$(mktemp -d)
+            chart_dir="$extract_dir/chart"
+
+            # Copy the Helm chart artifact to a local directory
+            if skopeo copy --retry-times 3 "docker://$container_image" "dir:$chart_dir" 2>/dev/null; then
+              echo "  ✓ Successfully copied Helm chart artifact"
+
+              # Look for the chart content layer (tar+gzip)
+              if [ -d "$chart_dir" ]; then
+                echo "  📁 Chart directory contents:"
+                ls -la "$chart_dir" || echo "    (failed to list directory)"
+
+                # Find and extract the chart content tarball
+                chart_tarball=""
+                for file in "$chart_dir"/*; do
+                  if [ -f "$file" ]; then
+                    # Check if this looks like a layer file (long hex name) and try to extract it
+                    filename=$(basename "$file")
+                    if [[ "$filename" =~ ^[a-f0-9]{64}$ ]]; then
+                      chart_tarball="$file"
+                      echo "  📦 Found chart layer file: $(basename "$file")"
+                      break
+                    fi
+                  fi
+                done
+
+                if [ -n "$chart_tarball" ]; then
+                  # Extract the tarball
+                  extract_content_dir="$extract_dir/content"
+                  mkdir -p "$extract_content_dir"
+
+                  if tar -xzf "$chart_tarball" -C "$extract_content_dir" 2>/dev/null; then
+                    echo "  ✓ Successfully extracted chart content"
+                    echo "  📄 High-level chart files:"
+
+                    # Show high-level file structure
+                    find "$extract_content_dir" -maxdepth 2 -type f | head -10 | while read -r file; do
+                      rel_path=$(echo "$file" | sed "s|$extract_content_dir/||")
+                      echo "    - $rel_path"
+                    done
+
+                    # Show Chart.yaml content if it exists
+                    chart_yaml=$(find "$extract_content_dir" -name "Chart.yaml" -o -name "chart.yaml" | head -1)
+                    if [ -n "$chart_yaml" ]; then
+                      echo "  📋 Chart.yaml content:"
+                      sed 's/^/    /' "$chart_yaml" 2>/dev/null || echo "    (failed to read Chart.yaml)"
+                    fi
+
+                    # 🚀 UPDATE IMAGE REFERENCES IN HELM CHART
+                    echo "  🔄 Updating image references from build-time to release-time repositories..."
+
+                    updated_files_count=0
+
+                    # Find all YAML files that might contain image references
+                    find "$extract_content_dir" -name "*.yaml" -o -name "*.yml" | while read -r yaml_file; do
+                      echo "    🔍 Checking file: $(echo "$yaml_file" | sed "s|$extract_content_dir/||")"
+
+                      # Look for image references and update them using the mapping
+                      if grep -q "image:" "$yaml_file" 2>/dev/null; then
+                        echo "      📝 Found image references in file"
+
+                        # Create backup
+                        cp "$yaml_file" "$yaml_file.bak"
+
+                        # Update image references using the build-to-release mapping
+                        if [ "$build_to_release_mapping" != "{}" ]; then
+                          # Extract all build repos from mapping
+                          echo "$build_to_release_mapping" | jq -r 'to_entries[] | select(.value.release_repo != "") | "\(.value.build_repo) \(.value.release_repo)"' | while read -r build_repo release_repo; do
+                            if [ -n "$build_repo" ] && [ -n "$release_repo" ]; then
+                              echo "        🔄 Replacing $build_repo → $release_repo"
+                              sed -i "s|$build_repo|$release_repo|g" "$yaml_file"
+                            fi
+                          done
+
+                          # Check if file was actually modified
+                          if ! cmp -s "$yaml_file" "$yaml_file.bak"; then
+                            echo "      ✅ Updated image references in $(basename "$yaml_file")"
+                            updated_files_count=$((updated_files_count + 1))
+
+                            # Show the changes
+                            echo "      📊 Changes made:"
+                            diff "$yaml_file.bak" "$yaml_file" | head -5 | sed 's/^/        /' || true
+                          else
+                            echo "      ℹ️  No changes needed in $(basename "$yaml_file")"
+                          fi
+                        else
+                          echo "      ⚠️  No build-to-release mapping available"
+                        fi
+
+                        rm -f "$yaml_file.bak"
+                      fi
+                    done
+
+                    echo "  📊 Updated image references in $updated_files_count files"
+
+                  else
+                    echo "  ⚠️  Failed to extract chart tarball"
+                  fi
+                else
+                  echo "  ⚠️  No chart tarball found in copied artifact"
+                fi
+              else
+                echo "  ⚠️  Chart directory not found after copy"
+              fi
+            else
+              echo "  ⚠️  Failed to copy Helm chart artifact"
+            fi
+
+            # Clean up temporary directory
+            rm -rf "$extract_dir"
+
+            # 🚀 PACKAGE AND PUSH THE UPDATED HELM CHART
+            if [ -n "$helm_chart_repository" ]; then
+              echo "  🚀 Packaging and pushing updated Helm chart to release repository..."
+
+              # Create a working directory for the updated chart
+              work_dir=$(mktemp -d)
+              chart_extract_dir="$work_dir/chart_content"
+
+                                                        # Extract the original chart
+              if skopeo copy --retry-times 3 "docker://$container_image" "dir:$work_dir/original" 2>/dev/null; then
+                echo "    ✓ Downloaded original chart"
+
+                # Find and extract the chart layer
+                chart_tarball=""
+                for file in "$work_dir/original"/*; do
+                  if [ -f "$file" ]; then
+                    filename=$(basename "$file")
+                    if [[ "$filename" =~ ^[a-f0-9]{64}$ ]]; then
+                      chart_tarball="$file"
+                      break
+                    fi
+                  fi
+                done
+
+                if [ -n "$chart_tarball" ] && tar -xzf "$chart_tarball" -C "$work_dir" 2>/dev/null; then
+                  echo "    ✓ Extracted chart content"
+
+                  # Find the actual chart directory (should contain Chart.yaml)
+                  chart_dir=""
+                  for dir in "$work_dir"/*; do
+                    if [ -d "$dir" ] && [ -f "$dir/Chart.yaml" ]; then
+                      chart_dir="$dir"
+                      break
+                    fi
+                  done
+
+                  if [ -z "$chart_dir" ]; then
+                    # If no Chart.yaml found in subdirs, check if it's in the root
+                    if [ -f "$work_dir/Chart.yaml" ]; then
+                      chart_dir="$work_dir"
+                    fi
+                  fi
+
+                  if [ -n "$chart_dir" ]; then
+                    echo "    ✓ Found chart directory: $(basename "$chart_dir")"
+
+                    # Update image references in the chart
+                    echo "    🔄 Updating image references..."
+                    updated_files_count=0
+
+                    find "$chart_dir" -name "*.yaml" -o -name "*.yml" | while read -r yaml_file; do
+                      if grep -q "image:" "$yaml_file" 2>/dev/null; then
+                        echo "      📝 Updating $(echo "$yaml_file" | sed "s|$chart_dir/||")"
+                        cp "$yaml_file" "$yaml_file.bak"
+
+                        if [ "$build_to_release_mapping" != "{}" ]; then
+                          echo "$build_to_release_mapping" | jq -r 'to_entries[] | select(.value.release_repo != "") | "\(.value.build_repo) \(.value.release_repo)"' | while read -r build_repo release_repo; do
+                            if [ -n "$build_repo" ] && [ -n "$release_repo" ]; then
+                              echo "        🔄 Replacing $build_repo → $release_repo"
+                              sed -i "s|$build_repo|$release_repo|g" "$yaml_file"
+                              updated_files_count=$((updated_files_count + 1))
+                            fi
+                          done
+                        fi
+                      fi
+                    done
+
+                    echo "    📊 Updated image references in chart files"
+
+                    # Debug: Show chart directory structure
+                    echo "    🔍 Debug: Chart directory structure:"
+                    ls -la "$chart_dir" || echo "    ❌ Cannot list chart directory"
+                    if [ -f "$chart_dir/Chart.yaml" ]; then
+                      echo "    ✓ Chart.yaml found"
+                      head -n 5 "$chart_dir/Chart.yaml" | sed 's/^/      /'
+                    else
+                      echo "    ❌ Chart.yaml NOT found"
+                    fi
+
+                    # Package the chart using Helm
+                    package_dir="$work_dir/packages"
+                    mkdir -p "$package_dir"
+
+                    echo "    📦 Packaging chart with Helm..."
+                    if helm package "$chart_dir" -d "$package_dir"; then
+                      echo "    ✅ Successfully packaged chart"
+
+                      # Find the packaged chart file
+                      chart_package=$(find "$package_dir" -name "*.tgz" | head -1)
+                      if [ -n "$chart_package" ]; then
+                        echo "    📦 Created package: $(basename "$chart_package")"
+
+                        # Push the chart using Helm
+                        echo "    🚀 Pushing chart to OCI registry..."
+                        if helm push "$chart_package" "oci://$helm_chart_repository"; then
+                          echo "    ✅ Successfully pushed chart to: oci://$helm_chart_repository"
+
+                          # Extract chart information for results
+                          chart_name=$(helm show chart "$chart_package" | yq e '.name' -)
+                          chart_version=$(helm show chart "$chart_package" | yq e '.version' -)
+
+                                                    # Get the pushed chart digest by inspecting the OCI artifact
+                          # Note: Helm converts + to _ in OCI tags, so we need to handle this
+                          chart_version_for_oci=$(echo "$chart_version" | sed 's/+/_/g')
+                          pushed_chart_reference="$helm_chart_repository/$chart_name:$chart_version_for_oci"
+                          echo "    🔍 Getting chart digest for: $pushed_chart_reference"
+
+                          set +x  # Temporarily disable debug output
+                          chart_digest=$(skopeo inspect --retry-times 3 --no-tags "docker://$pushed_chart_reference" 2>/dev/null | jq -r '.Digest // empty' || echo "")
+                          set -x  # Re-enable debug output
+
+                          if [ -n "$chart_digest" ]; then
+                            echo "    ✅ Chart digest: $chart_digest"
+
+                            # Store chart information for results file
+                            chart_result_info=$(jq -n \
+                              --arg name "$chart_name" \
+                              --arg version "$chart_version" \
+                              --arg digest "$chart_digest" \
+                              --arg repository "$helm_chart_repository" \
+                              --arg full_ref "$pushed_chart_reference" \
+                              '{
+                                "name": $name,
+                                "version": $version,
+                                "shasum": $digest,
+                                "urls": ["oci://\($full_ref)"],
+                                "repository": $repository
+                              }')
+                            echo "    📊 Chart result info: $chart_result_info"
+
+                            # Add chart result to the array for release CR status
+                            chart_results=$(echo "$chart_results" | jq ". + [$chart_result_info]")
+                          else
+                            echo "    ⚠️  Could not get chart digest, skipping results entry"
+                          fi
+
+                        else
+                          echo "    ⚠️  Failed to push chart to: oci://$helm_chart_repository"
+                        fi
+                      else
+                        echo "    ⚠️  No packaged chart file found"
+                      fi
+                    else
+                      echo "    ⚠️  Failed to package chart with Helm"
+                    fi
+                  else
+                    echo "    ⚠️  Could not find Chart.yaml in extracted content"
+                  fi
+                else
+                  echo "    ⚠️  Failed to extract chart content"
+                fi
+              else
+                echo "    ⚠️  Failed to download original chart"
+              fi
+
+              # Clean up work directory
+              rm -rf "$work_dir"
+            else
+              echo "  ⚠️  No Helm chart repository configured - skipping packaging and push"
+            fi
+
+            # Add Helm chart info to processed charts with registry and digest info
+            chart_info=$(echo "$component" | jq \
+              --arg media_type "$media_type" \
+              --argjson registry_destinations "$registry_destinations" \
+              --arg pushed_digest "$pushed_digest" \
+              --arg helm_chart_repository "$helm_chart_repository" \
+              '. + {
+                "detected_media_type": $media_type,
+                "is_helm_chart": true,
+                "content_extracted": true,
+                "chart_packaged_with_helm": true,
+                "helm_chart_repository": $helm_chart_repository,
+                "registry_destinations": $registry_destinations,
+                "pushed_digest": $pushed_digest
+              }')
+            processed_charts=$(echo "$processed_charts" | jq ". + [$chart_info]")
+
+          else
+            echo "  ℹ️  Not a Helm chart (mediaType: $media_type), skipping"
+          fi
+        done
+
+        echo "$processed_charts" > "$(results.processedHelmCharts.path)"
+        echo "Processed $(echo "$processed_charts" | jq length) Helm charts from $component_count total components"
+        echo "Helm chart detection complete"
+
+        # Create results file for release CR status update (similar to push-snapshot)
+        if [ -n "$(params.resultsDirPath)" ] && [ "$(echo "$chart_results" | jq length)" -gt 0 ]; then
+          results_dir="$DATADIR/$(params.resultsDirPath)"
+          mkdir -p "$results_dir"
+
+          # Create the helm chart results file with the same structure as push-snapshot
+          helm_results_file="$results_dir/prepare-and-push-helm-chart-results.json"
+          echo '{"charts":[]}' | jq --argjson charts "$chart_results" '.charts = $charts' > "$helm_results_file"
+
+          echo "📊 Created Helm chart results file: $helm_results_file"
+          echo "📊 Chart results: $(cat "$helm_results_file")"
+        else
+          echo "📊 No results directory specified or no charts processed, skipping results file creation"
+        fi
+
+        # Set sourceDataArtifact result (required for trusted artifacts)
+        echo -n "" > "$(results.sourceDataArtifact.path)"
+
+    - name: create-trusted-artifact
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: /tekton/results/sourceDataArtifact
+        - name: workDir
+          value: $(params.dataDir)
+
+    - name: patch-source-data-artifact-result
+      computeResources:
+        requests:
+          cpu: 20m
+          memory: 32Mi
+        limits:
+          memory: 32Mi
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/patch-source-data-artifact-result/patch-source-data-artifact-result.yaml
+      params:
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)

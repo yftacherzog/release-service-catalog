@@ -1,0 +1,253 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: test-prepare-and-push-helm-chart-minimal
+spec:
+  description: |
+    Minimal test for prepare-and-push-helm-chart task.
+    Test basic functionality with trusted artifacts parameters.
+  workspaces:
+    - name: tests-workspace
+  params:
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored.
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the OCI repository. An empty string means the artifacts do not expire.
+      type: string
+      default: "1d"
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: "--insecure"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable.
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: "/workspace/data"
+  tasks:
+    - name: setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+      taskSpec:
+        workspaces:
+          - name: data
+        steps:
+          - name: create-test-snapshots
+            image: quay.io/yftacherzog/release-service-utils:helm-cli
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              # Create simple test snapshot files
+              cat > "$(workspaces.data.path)/test_excluded_snapshot.json" << 'EOF'
+              {
+                "application": "testapp",
+                "components": [
+                  {
+                    "name": "squid-helm",
+                    "containerImage": "quay.io/test/squid-helm:latest"
+                  }
+                ]
+              }
+              EOF
+
+              cat > "$(workspaces.data.path)/test_included_snapshot.json" << 'EOF'
+              {
+                "application": "testapp",
+                "components": [
+                  {
+                    "name": "squid",
+                    "containerImage": "quay.io/test/squid:latest"
+                  }
+                ]
+              }
+              EOF
+
+              # Create mock original snapshot (build-time images)
+              cat > "$(workspaces.data.path)/snapshot_spec.json.orig" << 'EOF'
+              {
+                "application": "testapp",
+                "components": [
+                  {
+                    "name": "squid",
+                    "containerImage": "quay.io/yftacherzog-konflux/user-ns2/squid@sha256:buildtime123"
+                  },
+                  {
+                    "name": "squid-helm",
+                    "containerImage": "quay.io/yftacherzog-konflux/user-ns2/squid-helm@sha256:buildtime456"
+                  }
+                ]
+              }
+              EOF
+
+              # Create mock mapped snapshot (release-time repositories)
+              cat > "$(workspaces.data.path)/snapshot_spec.json" << 'EOF'
+              {
+                "application": "testapp",
+                "components": [
+                  {
+                    "name": "squid",
+                    "containerImage": "quay.io/yftacherzog-konflux/user-ns2/squid@sha256:buildtime123",
+                    "repository": "quay.io/test/squid-release"
+                  },
+                  {
+                    "name": "squid-helm",
+                    "containerImage": "quay.io/yftacherzog-konflux/user-ns2/squid-helm@sha256:buildtime456",
+                    "repository": "quay.io/test/squid-helm-release"
+                  }
+                ]
+              }
+              EOF
+
+              # Create mock push results
+              mkdir -p "$(workspaces.data.path)/results"
+              cat > "$(workspaces.data.path)/results/push-snapshot-results.json" << 'EOF'
+              {
+                "images": [
+                  {
+                    "name": "squid-helm",
+                    "shasum": "sha256:abc123def456789",
+                    "urls": [
+                      "quay.io/test/squid-helm-release:latest",
+                      "quay.io/test/squid-helm-release:v1.0.0",
+                      "quay.io/test/squid-helm-release:abc123def456789"
+                    ]
+                  }
+                ]
+              }
+              EOF
+
+              # Create mock ReleasePlanAdmission data with Helm chart repository mapping
+              cat > "$(workspaces.data.path)/data.json" << 'EOF'
+              {
+                "mapping": {
+                  "components": [
+                    {
+                      "name": "squid",
+                      "repository": "quay.io/test/squid-release"
+                    },
+                    {
+                      "name": "squid-helm",
+                      "repository": "quay.io/test/squid-helm-release"
+                    }
+                  ]
+                }
+              }
+              EOF
+
+              echo "Created test snapshot files:"
+              echo "  Excluded: $(workspaces.data.path)/test_excluded_snapshot.json"
+              echo "  Included: $(workspaces.data.path)/test_included_snapshot.json"
+              echo "  Original: $(workspaces.data.path)/snapshot_spec.json.orig"
+              echo "  Mapped: $(workspaces.data.path)/snapshot_spec.json"
+              echo "  Push results: $(workspaces.data.path)/results/push-snapshot-results.json"
+              echo "  ReleasePlanAdmission data: $(workspaces.data.path)/data.json"
+
+    - name: run-task
+      taskRef:
+        name: prepare-and-push-helm-chart
+      params:
+        - name: excludedSnapshotPath
+          value: "test_excluded_snapshot.json"
+        - name: includedSnapshotPath
+          value: "test_included_snapshot.json"
+        - name: resultsDirPath
+          value: "results"
+        - name: dataPath
+          value: "data.json"
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: ociArtifactExpiresAfter
+          value: $(params.ociArtifactExpiresAfter)
+        - name: orasOptions
+          value: $(params.orasOptions)
+        - name: sourceDataArtifact
+          value: ""
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: trustedArtifactsDebug
+          value: $(params.trustedArtifactsDebug)
+        - name: taskGitUrl
+          value: "http://localhost"
+        - name: taskGitRevision
+          value: "main"
+      runAfter:
+        - setup
+      workspaces:
+        - name: data
+          workspace: tests-workspace
+
+    - name: check-result
+      params:
+        - name: processedHelmCharts
+          value: $(tasks.run-task.results.processedHelmCharts)
+      runAfter:
+        - run-task
+      taskSpec:
+        params:
+          - name: processedHelmCharts
+            type: string
+        steps:
+          - name: check-result
+            image: quay.io/konflux-ci/tools@sha256:8ceffcd5d33378b27ab3b8fb8ab40704c46bfebf5868f9415d481a1d5e3ff388
+            script: |
+              #!/usr/bin/env bash
+              set -eux
+
+              echo "🔍 Checking task results..."
+
+              # Get the result content from parameter
+              raw_result="$(params.processedHelmCharts)"
+              echo "📋 Raw result content:"
+              echo "$raw_result"
+
+              # Basic validation - check that we got some content
+              if [ -z "$raw_result" ]; then
+                echo "❌ No result content received"
+                exit 1
+              fi
+
+              # Check for key indicators that the Helm processing worked
+              if echo "$raw_result" | grep -q "squid-helm"; then
+                echo "✅ Found expected component name 'squid-helm'"
+              else
+                echo "❌ Expected component name 'squid-helm' not found"
+                exit 1
+              fi
+
+              if echo "$raw_result" | grep -q "chart_packaged_with_helm"; then
+                echo "✅ Found Helm packaging indicator"
+              else
+                echo "❌ Helm packaging indicator not found"
+                exit 1
+              fi
+
+              if echo "$raw_result" | grep -q "quay.io/test/squid-helm-release"; then
+                echo "✅ Found expected Helm chart repository"
+              else
+                echo "❌ Expected Helm chart repository not found"
+                exit 1
+              fi
+
+              if echo "$raw_result" | grep -q "sha256:abc123def456789"; then
+                echo "✅ Found expected digest from push results"
+              else
+                echo "❌ Expected digest not found"
+                exit 1
+              fi
+
+              echo "✅ All basic validations passed!"
+              echo "📦 Helm chart processing appears to have worked correctly"
+              echo ""
+              echo "Key achievements verified:"
+              echo "  ✅ Chart detected and processed"
+              echo "  ✅ Packaged with Helm CLI"
+              echo "  ✅ Repository information preserved"
+              echo "  ✅ Push result data included"

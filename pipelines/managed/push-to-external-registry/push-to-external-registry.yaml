@@ -52,7 +52,7 @@ spec:
     - name: ociStorage
       type: string
       description: The OCI repository where the Trusted Artifacts are stored
-      default: "quay.io/konflux-ci/release-service-trusted-artifacts"
+      default: "quay.io/yftacherzog-konflux/user-ns2/squid-release-pipeline"
     - name: orasOptions
       description: oras options to pass to Trusted Artifacts calls
       type: string
@@ -67,6 +67,10 @@ spec:
       # to avoid tar extraction errors, we need to specify a subdirectory
       # inside the volume.
       default: "/var/workdir/release"
+    - name: filters
+      description: JSON array of filter criteria for filtering snapshot components. Each filter is an object with 'path' and 'value'
+      type: string
+      default: '[{"path": ".config.mediaType", "value": "application/vnd.cncf.helm.config.v1+json"}]'
   workspaces:
     - name: release-workspace
   tasks:
@@ -313,6 +317,40 @@ spec:
       runAfter:
         - apply-mapping
         - collect-task-params
+    - name: filter-snapshot
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/managed/filter-snapshot/filter-snapshot.yaml
+      params:
+        - name: snapshotPath
+          value: "$(tasks.collect-data.results.snapshotSpec)"
+        - name: dataPath
+          value: "$(tasks.collect-data.results.data)"
+        - name: filters
+          value: $(params.filters)
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: "$(tasks.apply-mapping.results.sourceDataArtifact)"
+        - name: trustedArtifactsDebug
+          value: "$(params.trustedArtifactsDebug)"
+        - name: taskGitUrl
+          value: "$(params.taskGitUrl)"
+        - name: taskGitRevision
+          value: "$(params.taskGitRevision)"
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      runAfter:
+        - verify-conforma
     - name: push-snapshot
       retries: 5
       when:
@@ -330,7 +368,7 @@ spec:
             value: tasks/managed/push-snapshot/push-snapshot.yaml
       params:
         - name: snapshotPath
-          value: "$(tasks.collect-data.results.snapshotSpec)"
+          value: "$(tasks.filter-snapshot.results.includedSnapshotPath)"
         - name: dataPath
           value: "$(tasks.collect-data.results.data)"
         - name: resultsDirPath
@@ -338,7 +376,7 @@ spec:
         - name: ociStorage
           value: $(params.ociStorage)
         - name: sourceDataArtifact
-          value: "$(tasks.apply-mapping.results.sourceDataArtifact)"
+          value: "$(tasks.filter-snapshot.results.sourceDataArtifact)"
         - name: dataDir
           value: $(params.dataDir)
         - name: trustedArtifactsDebug
@@ -351,7 +389,43 @@ spec:
         - name: data
           workspace: release-workspace
       runAfter:
-        - verify-conforma
+        - filter-snapshot
+    - name: prepare-and-push-helm-chart
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/managed/prepare-and-push-helm-chart/prepare-and-push-helm-chart.yaml
+      params:
+        - name: excludedSnapshotPath
+          value: "$(tasks.filter-snapshot.results.excludedSnapshotPath)"
+        - name: includedSnapshotPath
+          value: "$(tasks.filter-snapshot.results.includedSnapshotPath)"
+        - name: resultsDirPath
+          value: "$(tasks.collect-data.results.resultsDir)"
+        - name: dataPath
+          value: "$(tasks.collect-data.results.data)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: "$(tasks.filter-snapshot.results.sourceDataArtifact)"
+        - name: trustedArtifactsDebug
+          value: "$(params.trustedArtifactsDebug)"
+        - name: taskGitUrl
+          value: "$(params.taskGitUrl)"
+        - name: taskGitRevision
+          value: "$(params.taskGitRevision)"
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      runAfter:
+        - filter-snapshot
     - name: collect-registry-token-secret
       taskRef:
         resolver: "git"
@@ -384,6 +458,43 @@ spec:
           workspace: release-workspace
       runAfter:
         - collect-data
+    - name: reconstruct-snapshot
+      taskRef:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: tasks/managed/reconstruct-snapshot/reconstruct-snapshot.yaml
+      params:
+        - name: includedSnapshotPath
+          value: "$(tasks.filter-snapshot.results.includedSnapshotPath)"
+        - name: excludedSnapshotPath
+          value: "$(tasks.filter-snapshot.results.excludedSnapshotPath)"
+        - name: dataPath
+          value: "$(tasks.collect-data.results.data)"
+        - name: resultsDirPath
+          value: "$(tasks.collect-data.results.resultsDir)"
+        - name: dataDir
+          value: $(params.dataDir)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: "$(tasks.filter-snapshot.results.sourceDataArtifact)"
+        - name: trustedArtifactsDebug
+          value: "$(params.trustedArtifactsDebug)"
+        - name: taskGitUrl
+          value: "$(params.taskGitUrl)"
+        - name: taskGitRevision
+          value: "$(params.taskGitRevision)"
+      workspaces:
+        - name: data
+          workspace: release-workspace
+      runAfter:
+        - push-snapshot
+        - prepare-and-push-helm-chart
     - name: make-repo-public
       retries: 5
       when:
@@ -410,7 +521,7 @@ spec:
         - name: ociStorage
           value: $(params.ociStorage)
         - name: sourceDataArtifact
-          value: "$(tasks.push-snapshot.results.sourceDataArtifact)"
+          value: "$(tasks.reconstruct-snapshot.results.sourceDataArtifact)"
         - name: dataDir
           value: $(params.dataDir)
         - name: trustedArtifactsDebug
@@ -421,7 +532,7 @@ spec:
           value: "$(params.taskGitRevision)"
       runAfter:
         - collect-registry-token-secret
-        - push-snapshot
+        - reconstruct-snapshot
     - name: update-cr-status
       params:
         - name: resource
@@ -434,7 +545,7 @@ spec:
           value: $(params.ociStorage)
         - name: resultArtifacts
           value:
-            - "$(tasks.push-snapshot.results.sourceDataArtifact)=$(params.dataDir)"
+            - "$(tasks.reconstruct-snapshot.results.sourceDataArtifact)=$(params.dataDir)"
         - name: dataDir
           value: $(params.dataDir)
         - name: trustedArtifactsDebug
@@ -456,4 +567,4 @@ spec:
         - name: data
           workspace: release-workspace
       runAfter:
-        - push-snapshot
+        - reconstruct-snapshot
