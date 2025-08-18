@@ -1,0 +1,420 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: push-rpm-data-to-pyxis-mock
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    MOCK VERSION: Tekton task that simulates extracting RPMs from SBOMs and shows what would be pushed to Pyxis.
+    This mock version shows all the data and operations without actually connecting to Pyxis.
+    Use this for testing when you don't have Pyxis credentials.
+  params:
+    - name: pyxisJsonPath
+      description: Path to the JSON string of the saved Pyxis data in the data workspace
+      type: string
+    - name: pyxisSecret
+      type: string
+      description: |
+        The kubernetes secret to use to authenticate to Pyxis. MOCK VERSION: This is ignored.
+      default: "mock-secret"
+    - name: server
+      type: string
+      description: The server type to use. Options are 'production','production-internal,'stage-internal' and 'stage'
+      default: production
+    - name: concurrentLimit
+      type: string
+      description: The maximum number of images to be processed at once
+      default: 20
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: subdirectory
+      # subdirectory is only needed for testing purposes
+      description: Subdirectory inside the workspace to be used
+      type: string
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+  results:
+    - description: Produced trusted data artifact
+      name: sourceDataArtifact
+      type: string
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+      - name: RETRIES
+        value: "3"  # Default number of retries for cosign download
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: mock-download-sboms
+      image: quay.io/konflux-ci/release-service-utils:fe734aa04168690e96f0a729f93845e7c70b7934
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 512Mi
+          cpu: 500m
+      script: |
+        #!/usr/bin/env bash
+        set -eux
+
+        echo "🎭 MOCK MODE: This is a mock version of push-rpm-data-to-pyxis"
+        echo "🎭 MOCK MODE: We will show what would be done without actually connecting to Pyxis"
+        echo
+
+        PYXIS_FILE="$(params.dataDir)/$(params.pyxisJsonPath)"
+        if [ ! -f "${PYXIS_FILE}" ] ; then
+            echo "No valid pyxis file was provided."
+            exit 1
+        fi
+
+        echo "📄 PYXIS INPUT FILE CONTENT:"
+        echo "==============================================="
+        cat "${PYXIS_FILE}" | jq '.'
+        echo "==============================================="
+        echo
+
+        # Create a mapping of unique imageIds to their SBOM files for efficient download
+        echo "🔍 Creating unique imageId mapping for efficient SBOM download..."
+        UNIQUE_IMAGES_FILE="$(mktemp)"
+        jq '
+        # Flatten all pyxisImages and preserve component containerImage
+        [.components[] as $c | $c.pyxisImages[] | {
+          imageId: .imageId,
+          containerImage: $c.containerImage,
+          pyxisImage: .
+        }]
+        | group_by(.imageId)
+        | map({
+          imageId: .[0].imageId,
+          containerImage: .[0].containerImage,
+          pyxisImage: .[0].pyxisImage,
+          # Include all instances for later processing
+          instances: .
+        })' "${PYXIS_FILE}" > "${UNIQUE_IMAGES_FILE}"
+
+        echo "📊 UNIQUE IMAGES TO PROCESS:"
+        echo "==============================================="
+        cat "${UNIQUE_IMAGES_FILE}" | jq '.'
+        echo "==============================================="
+        echo
+
+        SBOM_PATH="$(dirname "$(params.pyxisJsonPath)")/downloaded-sboms"
+        # The dir might already exist in case of retries of the task.
+        # No need for a cleanup - we will just override the files.
+        mkdir -p "$(params.dataDir)/${SBOM_PATH}"
+        cd "$(params.dataDir)/${SBOM_PATH}"
+
+        # Mock function to simulate SBOM download
+        mock_download_sbom_for_image() {
+            local pyxis_image="$1"
+            local image_url="$2"
+
+            local file
+            local digest
+            local arch_digest
+            local os
+            local arch
+            local platform
+
+            file="$(jq -r '.imageId' <<< "$pyxis_image").json"
+            digest="$(jq -r '.digest' <<< "$pyxis_image")"
+            arch_digest="$(jq -r '.arch_digest' <<< "$pyxis_image")"
+
+            echo "🎭 MOCK: Would download SBOM for image: $image_url"
+            echo "🎭 MOCK: Image ID: $(jq -r '.imageId' <<< "$pyxis_image")"
+            echo "🎭 MOCK: Digest: $digest"
+            echo "🎭 MOCK: Arch Digest: $arch_digest"
+
+            # You can't pass --platform to a single arch image or cosign errors.
+            # If digest equals arch_digest, then it's a single arch image
+            if [ "$digest" = "$arch_digest" ] ; then
+              echo "🎭 MOCK: Would fetch sbom for single arch image: $image_url to: $file"
+              echo "🎭 MOCK: Command would be: cosign download sbom --output-file ${file} ${image_url}"
+            else
+              os=$(jq -r '.os' <<< "$pyxis_image")
+              arch=$(jq -r '.arch' <<< "$pyxis_image")
+              platform="${os}/${arch}"
+              echo "🎭 MOCK: Would fetch sbom for image: $image_url with platform: $platform to: $file"
+              echo "🎭 MOCK: Command would be: cosign download sbom --output-file ${file} --platform ${platform} ${image_url}"
+            fi
+
+            # Create a mock SBOM file
+            cat > "${file}" << 'EOF'
+        {
+          "spdxVersion": "SPDX-2.3",
+          "dataLicense": "CC0-1.0",
+          "SPDXID": "SPDXRef-DOCUMENT",
+          "name": "mock-sbom",
+          "documentNamespace": "https://mock.example.com/mock-sbom",
+          "creationInfo": {
+            "created": "2024-01-01T00:00:00Z",
+            "creators": ["Tool: mock-sbom-generator"]
+          },
+          "packages": [
+            {
+              "SPDXID": "SPDXRef-Package-rpm-example",
+              "name": "example-package",
+              "downloadLocation": "NOASSERTION",
+              "filesAnalyzed": false,
+              "externalRefs": [
+                {
+                  "referenceCategory": "PACKAGE-MANAGER",
+                  "referenceType": "purl",
+                  "referenceLocator": "pkg:rpm/rhel/example-package@1.0.0-1.el9?arch=x86_64&repository_id=rhel-9-for-x86_64-baseos-rpms"
+                }
+              ]
+            }
+          ]
+        }
+        EOF
+        }
+
+        # Process unique images
+        UNIQUE_IMAGES_COUNT=$(jq '. | length' "${UNIQUE_IMAGES_FILE}")
+        echo "🔄 Mock downloading SBOMs for $UNIQUE_IMAGES_COUNT unique images..."
+
+        for (( i=0; i < UNIQUE_IMAGES_COUNT; i++ )); do
+          UNIQUE_IMAGE=$(jq -c --argjson i "$i" '.[$i]' "${UNIQUE_IMAGES_FILE}")
+          IMAGEID=$(jq -r '.imageId' <<< "${UNIQUE_IMAGE}")
+          CONTAINER_IMAGE=$(jq -r '.containerImage' <<< "${UNIQUE_IMAGE}")
+          PYXIS_IMAGE=$(jq -c '.pyxisImage' <<< "${UNIQUE_IMAGE}")
+
+          echo "🎯 Processing IMAGE: $IMAGEID from URL: $CONTAINER_IMAGE"
+          mock_download_sbom_for_image "$PYXIS_IMAGE" "$CONTAINER_IMAGE"
+          echo
+        done
+
+        echo "✅ All mock SBOM downloads completed"
+
+        # Verify we created the expected number of mock SBOMs
+        if [ "$UNIQUE_IMAGES_COUNT" -eq 0 ]; then
+          echo "✅ No images to process - all artifacts were filtered out (likely all Helm charts)"
+          SBOM_COUNT=0
+        else
+          sbom_files=(*.json)
+          SBOM_COUNT=${#sbom_files[@]}
+          if [ "$SBOM_COUNT" != "$UNIQUE_IMAGES_COUNT" ]; then
+            echo "ERROR: Expected to create $UNIQUE_IMAGES_COUNT mock SBOMs, but only $SBOM_COUNT were created"
+            exit 1
+          fi
+          echo "✅ Created $SBOM_COUNT mock SBOM files"
+        fi
+    - name: mock-push-rpm-data-to-pyxis
+      image: quay.io/konflux-ci/release-service-utils:fe734aa04168690e96f0a729f93845e7c70b7934
+      computeResources:
+        limits:
+          memory: 512Mi
+        requests:
+          memory: 512Mi
+          cpu: '1'
+      script: |
+        #!/usr/bin/env bash
+        set -eu
+
+        echo "🎭 MOCK MODE: Simulating RPM data push to Pyxis"
+        echo "🎭 MOCK MODE: No actual Pyxis connection will be made"
+        echo
+
+        # Show what server would be used
+        if [[ "$(params.server)" == "production" ]]
+        then
+          PYXIS_GRAPHQL_API="https://graphql-pyxis.api.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "stage" ]]
+        then
+          PYXIS_GRAPHQL_API="https://graphql-pyxis.preprod.api.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "production-internal" ]]
+        then
+          PYXIS_GRAPHQL_API="https://graphql.pyxis.engineering.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "stage-internal" ]]
+        then
+          PYXIS_GRAPHQL_API="https://graphql.pyxis.stage.engineering.redhat.com/graphql/"
+        else
+          echo "Invalid server parameter. Only 'production','production-internal,'stage-internal' and 'stage' allowed."
+          exit 1
+        fi
+
+        echo "🌐 MOCK: Would connect to Pyxis API: $PYXIS_GRAPHQL_API"
+        echo "🔐 MOCK: Would use secret: $(params.pyxisSecret) (but this is mocked)"
+        echo
+
+        PYXIS_FILE="$(params.dataDir)/$(params.pyxisJsonPath)"
+        if [ ! -f "${PYXIS_FILE}" ] ; then
+            echo "No valid pyxis file was provided."
+            exit 1
+        fi
+
+        SBOM_PATH="$(dirname "$(params.pyxisJsonPath)")/downloaded-sboms"
+        cd "$(params.dataDir)/${SBOM_PATH}"
+
+        # Create a list of all images to push to Pyxis (including duplicates)
+        echo "📋 Creating list of all images to push to Pyxis..."
+        ALL_IMAGES_FILE="$(mktemp)"
+        jq '
+        # Flatten all pyxisImages from all components
+        [.components[] | .pyxisImages[]] |
+        map({
+          imageId: .imageId,
+          containerImage: .containerImage
+        })' "${PYXIS_FILE}" > "${ALL_IMAGES_FILE}"
+
+        echo "📊 ALL IMAGES TO PUSH (INCLUDING DUPLICATES):"
+        echo "==============================================="
+        cat "${ALL_IMAGES_FILE}" | jq '.'
+        echo "==============================================="
+        echo
+
+        TOTAL_IMAGES_TO_PUSH=$(jq '. | length' "${ALL_IMAGES_FILE}")
+        echo "🚀 Mock RPM data upload for $TOTAL_IMAGES_TO_PUSH total images"
+        echo "⚡ Concurrent limit: $(params.concurrentLimit)"
+        echo
+
+        if [ "$TOTAL_IMAGES_TO_PUSH" -eq 0 ]; then
+          echo "🎉 No images to process - all artifacts were filtered out (likely all Helm charts)"
+          echo "✅ All mock RPM data uploads completed successfully!"
+          echo "🎊 Summary:"
+          echo "   - Processed 0 images"
+          echo "   - Would connect to: $PYXIS_GRAPHQL_API"
+          echo "   - Would use secret: $(params.pyxisSecret)"
+          echo "   - All operations were mocked - no actual Pyxis API calls made"
+          echo "   - All artifacts were successfully filtered (Helm charts)"
+          exit 0
+        fi
+
+        for (( i=0; i < TOTAL_IMAGES_TO_PUSH; i++ )); do
+          IMAGE_DATA=$(jq -c --argjson i "$i" '.[$i]' "${ALL_IMAGES_FILE}")
+          IMAGEID=$(jq -r '.imageId' <<< "$IMAGE_DATA")
+          CONTAINER_IMAGE=$(jq -r '.containerImage' <<< "$IMAGE_DATA")
+
+          # Find the corresponding SBOM file
+          SBOM_FILE="${IMAGEID}.json"
+          if [ ! -f "$SBOM_FILE" ]; then
+            echo "ERROR: SBOM file $SBOM_FILE not found for image $IMAGEID"
+            exit 1
+          fi
+
+          echo "🎯 Processing IMAGE $((i+1))/$TOTAL_IMAGES_TO_PUSH: $IMAGEID"
+          echo "🖼️  Container Image: $CONTAINER_IMAGE"
+          echo "📄  SBOM File: $SBOM_FILE"
+
+          # Extract the format information using jq
+          UPLOAD_SCRIPT=$(
+            jq -r '
+              if .bomFormat == "CycloneDX" then
+                "upload_rpm_data_cyclonedx"
+              else if .spdxVersion then
+                "upload_rpm_data"
+              else
+                empty
+              end end' "$SBOM_FILE"
+          )
+
+          # If UPLOAD_SCRIPT is empty, it's not a valid SBOM (CycloneDX or SPDX)
+          if [ -z "$UPLOAD_SCRIPT" ]; then
+            echo "❌ Error: ${SBOM_FILE}: not a valid SBOM (CycloneDX or SPDX)"
+            exit 1
+          fi
+
+          echo "🔧  Would use upload script: $UPLOAD_SCRIPT"
+          echo "📦  SBOM Content Preview:"
+          echo "    -------------------------------------------"
+          jq -r '.packages[]? | select(.externalRefs[]?.referenceType == "purl") | "    RPM: " + (.externalRefs[] | select(.referenceType == "purl") | .referenceLocator)' "$SBOM_FILE" || echo "    No RPM packages found in SBOM"
+          echo "    -------------------------------------------"
+
+          echo "🎭  MOCK: Would execute: $UPLOAD_SCRIPT --retry --image-id $IMAGEID --sbom-path $SBOM_FILE --verbose"
+          echo "🎭  MOCK: This would extract RPMs from SBOM and create/update:"
+          echo "🎭    - RPM Manifest in Pyxis for image $IMAGEID"
+          echo "🎭    - ContainerImage.content_sets field with repository IDs from RPM purls"
+          echo "🎭  MOCK: API endpoint: $PYXIS_GRAPHQL_API"
+          echo
+        done
+
+        echo "✅ All mock RPM data uploads completed successfully!"
+        echo "🎊 Summary:"
+        echo "   - Processed $TOTAL_IMAGES_TO_PUSH images"
+        echo "   - Would connect to: $PYXIS_GRAPHQL_API"
+        echo "   - Would use secret: $(params.pyxisSecret)"
+        echo "   - All operations were mocked - no actual Pyxis API calls made"
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)

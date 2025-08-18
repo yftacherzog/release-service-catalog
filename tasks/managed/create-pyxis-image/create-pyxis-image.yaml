@@ -11,11 +11,11 @@ spec:
     Tekton task that pushes metadata to Pyxis for all container images contained in a snapshot that is the
     result of the `apply-mapping` task. It first extracts the containerImages from the snapshot, then runs
     `skopeo inspect` on each, before finally pushing metadata to Pyxis.
-    
+
     The task includes protection against race conditions that could occur when multiple components have the same
     digest. Components with the same digest are processed in series while different digest groups are processed
     in parallel, ensuring optimal performance while preventing conflicts.
-    
+
     The relative path of the pyxis.json file in the data workspace is output as a task result named
     `pyxisDataPath`.
   params:
@@ -263,6 +263,15 @@ spec:
                   "${PULLSPEC}" \
                       | tee "${MANIFEST_FILE}"
 
+                # Check if this is a Helm chart and skip processing if so
+                CONFIG_MEDIA_TYPE=$(jq -r '.config.mediaType // empty' "${MANIFEST_FILE}")
+                if [[ "$CONFIG_MEDIA_TYPE" == "application/vnd.cncf.helm.config.v1+json" ]]; then
+                  echo "INFO: Skipping Helm chart component: ${CONTAINER_IMAGE} (not relevant for RPM processing)"
+                  # Create empty component structure to maintain consistency
+                  echo '{}' | tee "$output_file" > /dev/null
+                  return 0
+                fi
+
                 # When building images without squashing, their final layer might always be bit-wise identical.
                 # This causes upload to pyxis to fail which cannot tolerate duplicate "top_layer_id" values.
                 # This flag allows to overcome this limitation by just deleting the layers so that no layer
@@ -371,9 +380,9 @@ spec:
         process_digest_group() {
             local digest=$1
             local component_indices_string="$2"
-            
+
             echo "Processing components with digest: $digest"
-            
+
             # Process each component in the group in series
             for component_index in $component_indices_string; do
                 echo "Processing component $component_index for digest $digest"
@@ -388,7 +397,7 @@ spec:
         for (( i=0; i < COMPONENTS; i++ )); do
             CONTAINER_IMAGE=$(jq -r ".components[${i}].containerImage" "${SNAPSHOT_SPEC_FILE}")
             DIGEST="${CONTAINER_IMAGE##*@}"
-            
+
             if [[ -z "${digest_groups[$DIGEST]}" ]]; then
                 digest_groups[$DIGEST]="$i"
             else
@@ -440,15 +449,18 @@ spec:
             exit 1
         fi
 
-        # Collect and merge all component results
+        # Collect and merge all component results, skipping empty ones (Helm charts)
         JSON_OUTPUT='{}'
         for (( i=0; i < COMPONENTS; i++ )); do
             if [ -f "/tmp/component_${i}.json" ]; then
                 component_data=$(cat "/tmp/component_${i}.json")
-                component_index=$(jq -r '.componentIndex' <<< "$component_data")
-                JSON_OUTPUT=$(jq --argjson component_index "$component_index" --argjson \
-                  component_data "$component_data" \
-                  '.components[$component_index] = $component_data' <<< "$JSON_OUTPUT")
+                # Skip empty components (Helm charts that were filtered out)
+                if [[ "$component_data" != "{}" ]]; then
+                    component_index=$(jq -r '.componentIndex' <<< "$component_data")
+                    JSON_OUTPUT=$(jq --argjson component_index "$component_index" --argjson \
+                      component_data "$component_data" \
+                      '.components[$component_index] = $component_data' <<< "$JSON_OUTPUT")
+                fi
             fi
         done
         echo "$JSON_OUTPUT" | tee "$(params.dataDir)/${PYXIS_DATA_PATH}"

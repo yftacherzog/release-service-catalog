@@ -102,6 +102,9 @@ function oras() {
   elif [[ "$*" == "manifest fetch --registry-config"*image-with-gzipped-layers* ]]
   then
     echo '{"mediaType": "my_media_type", "layers": [{"mediaType": "blob+gzip", "digest": "beef"}, {"mediaType": "blob+gzip", "digest": "pork"}]}'
+  elif [[ "$*" == "manifest fetch --registry-config"*helm-chart* ]]
+  then
+    echo '{"schemaVersion": 2, "config": {"mediaType": "application/vnd.cncf.helm.config.v1+json", "digest": "sha256:19142d68f3aa4bc420a3342d0f76e23c276f463c39443b0ff6a15a1c4cbab2fc", "size": 485}, "layers": [{"mediaType": "application/vnd.cncf.helm.chart.content.v1.tar+gzip", "digest": "sha256:10761f8afeb85d07dca5c949702d3d848dfc4e87d556c46bd441ac9e9f5a2c44", "size": 269755}], "annotations": {"org.opencontainers.image.created": "2025-08-18T05:38:40Z", "org.opencontainers.image.description": "A Helm chart for deploying a Squid proxy server.", "org.opencontainers.image.title": "squid-helm", "org.opencontainers.image.version": "0.1.196+650e131"}}'
   elif [[ "$*" == "manifest fetch --registry-config"* ]]
   then
     echo '{"mediaType": "my_media_type", "layers": [{"mediaType": "blob+other", "digest": "tofu"}]}'

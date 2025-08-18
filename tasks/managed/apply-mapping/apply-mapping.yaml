@@ -9,16 +9,16 @@ metadata:
 spec:
   description: |-
     Tekton task to apply a mapping to a Snapshot.
-    
+
     The purpose of this task is to merge a mapping with the components contained in a Snapshot.
     The mapping is expected to be present in the data field of the ReleasePlanAdmission provided in
     the `releasePlanAdmissionPath`. If the data field does not contain a `mapping` key, the original
     Snapshot is returned. If there is a `mapping` key, it is merged with the `components` key in the
     Snapshot based on component name.
-    
+
     A `mapped` result is also returned from this task containing a simple true/false value that is
     meant to inform whether a mapped Snapshot is being returned or the original one.
-    
+
     This task supports variable expansion in tag values from the mapping. The currently supported variables are:
     * "{{ timestamp }}" -> The build-date label from the image in the format provided by timestampFormat or %s as the
       default.
@@ -29,7 +29,9 @@ spec:
     * "{{ digest_sha }}" -> The image digest of the respective component
     * "{{ incrementer }}" -> Automatically finds the highest existing incremented tag in the
       repository and generates the next sequential tag (e.g., if the highest tag is v1.0.0-2, it will generate v1.0.0-3)
-    
+    * "{{ oci_version }}" -> The version from OCI image annotations
+      (extracts org.opencontainers.image.version annotation and converts + to _ for tag compliance)
+
     You can also expand image labels, e.g. "{{ labels.mylabel }}" -> The value of image label "mylabel"
   params:
     - name: snapshotPath
@@ -370,10 +372,27 @@ spec:
             # tags per arch. So, we just use the first digest listed.
             arch="$(jq -rs 'map(.platform.architecture) | .[0]' <<< "$arch_json")"
             os="$(jq -rs 'map(.platform.os) | .[0]' <<< "$arch_json")"
-            image_metadata="$(skopeo inspect --retry-times 3 --no-tags --override-os "${os}" --override-arch "${arch}" \
-              docker://"${IMAGE_REF}" | jq -c)"
-            # For timestamp, use Labels.build-date and fallback to Created
-            build_date="$(jq -r '.Labels."build-date" // .Created // ""' <<< "$image_metadata")"
+
+            # Try normal skopeo inspect first (common case: regular container images)
+            if image_metadata="$(skopeo inspect --retry-times 3 --no-tags --override-os "${os}" --override-arch \
+            "${arch}" docker://"${IMAGE_REF}" 2>/dev/null | jq -c)" && [[ -n "$image_metadata" ]]; then
+                # Successfully got image metadata - this is a regular container image
+                build_date="$(jq -r '.Labels."build-date" // .Created // ""' <<< "$image_metadata")"
+                oci_version_raw="$(jq -r '.annotations."org.opencontainers.image.version" // ""' <<< "$image_metadata")"
+            else
+                # Failed to get image metadata - try raw manifest (could be Helm chart or other artifact type)
+                echo "Standard skopeo inspect failed for ${NAME}, trying raw manifest (non-image artifact)"
+                raw_manifest="$(skopeo inspect --retry-times 3 --no-tags --raw docker://"${IMAGE_REF}" | jq -c)"
+                oci_version_raw="$(jq -r '.annotations."org.opencontainers.image.version" // ""' <<< "$raw_manifest")"
+                build_date="$(jq -r '.annotations."org.opencontainers.image.created" // ""' <<< "$raw_manifest")"
+                # Create minimal image_metadata for compatibility (empty if parsing fails)
+                image_metadata="$(jq -n --argjson annotations "$(jq '.annotations // {}' <<< "$raw_manifest")" \
+                  '{"Labels": {}, "Created": "", "annotations": $annotations}' || echo '{}')"
+            fi
+
+            # Transform version to OCI tag format: replace + with _ (convention for OCI compliance)
+            oci_version="${oci_version_raw//+/_}"
+
             if [ "${build_date}" = "" ] ; then
               timestamp=""
             else
@@ -386,6 +405,7 @@ spec:
               --arg git_sha "${git_sha}" \
               --arg git_short_sha "${git_sha:0:7}" \
               --arg digest_sha "${build_sha}" \
+              --arg oci_version "${oci_version}" \
               '$ARGS.named')"
             labels="$(jq -c '.Labels' <<< "${image_metadata}")"
 

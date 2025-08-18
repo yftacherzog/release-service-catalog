@@ -1,0 +1,305 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: create-pyxis-image-mock
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.12.1"
+    tekton.dev/tags: release
+spec:
+  description: |-
+    MOCK VERSION: Tekton task that simulates creating Pyxis container image entries.
+    This mock version includes the Helm chart filtering logic and shows what would be done
+    without actually connecting to Pyxis. Use this for testing when you don't have Pyxis credentials.
+  params:
+    - name: server
+      type: string
+      description: The server type to use. Options are 'production','production-internal,'stage-internal' and 'stage'
+      default: production
+    - name: pyxisSecret
+      type: string
+      description: |
+        The kubernetes secret to use to authenticate to Pyxis. MOCK VERSION: This is ignored.
+      default: "mock-secret"
+    - name: snapshotPath
+      description: Path to the JSON file containing the mapped Snapshot spec in the data workspace
+      type: string
+    - name: dataPath
+      description: Path to the JSON string of the merged data to use in the data workspace
+      type: string
+    - name: pyxisJsonPath
+      description: Path to the JSON file containing the container images data for Pyxis
+      type: string
+      default: "pyxis.json"
+    - name: ociStorage
+      description: The OCI repository where the Trusted Artifacts are stored
+      type: string
+      default: "empty"
+    - name: ociArtifactExpiresAfter
+      description: Expiration date for the trusted artifacts created in the
+        OCI repository. An empty string means the artifacts do not expire
+      type: string
+      default: "1d"
+    - name: trustedArtifactsDebug
+      description: Flag to enable debug logging in trusted artifacts. Set to a non-empty string to enable
+      type: string
+      default: ""
+    - name: orasOptions
+      description: oras options to pass to Trusted Artifacts calls
+      type: string
+      default: ""
+    - name: sourceDataArtifact
+      type: string
+      description: Location of trusted artifacts to be used to populate data directory
+      default: ""
+    - name: dataDir
+      description: The location where data will be stored
+      type: string
+      default: /var/workdir/release
+    - name: taskGitUrl
+      type: string
+      description: The url to the git repo where the release-service-catalog tasks and stepactions to be used are stored
+    - name: taskGitRevision
+      type: string
+      description: The revision in the taskGitUrl repo to be used
+  results:
+    - description: Produced trusted data artifact
+      name: sourceDataArtifact
+      type: string
+    - description: Path to the JSON file containing the container images data for Pyxis
+      name: pyxisDataPath
+      type: string
+  volumes:
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    volumeMounts:
+      - mountPath: /var/workdir
+        name: workdir
+    env:
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.ociArtifactExpiresAfter)
+      - name: "ORAS_OPTIONS"
+        value: "$(params.orasOptions)"
+      - name: "DEBUG"
+        value: "$(params.trustedArtifactsDebug)"
+  steps:
+    - name: use-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/use-trusted-artifact/use-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: sourceDataArtifact
+          value: $(params.sourceDataArtifact)
+    - name: mock-create-pyxis-image
+      image: quay.io/konflux-ci/release-service-utils:a58dc96cb28b54cdef2564a346d43a6d7bd4d656
+      computeResources:
+        limits:
+          memory: 3Gi
+        requests:
+          memory: 3Gi
+          cpu: '1'
+      script: |
+        #!/usr/bin/env bash
+        set -exo pipefail
+
+        echo "🎭 MOCK MODE: This is a mock version of create-pyxis-image"
+        echo "🎭 MOCK MODE: We will show what would be done without actually connecting to Pyxis"
+        echo "🎭 MOCK MODE: Includes HELM CHART FILTERING logic for testing"
+        echo
+
+        # Show what server would be used
+        if [[ "$(params.server)" == "production" ]]
+        then
+          PYXIS_URL="https://pyxis.api.redhat.com/"
+          PYXIS_GRAPHQL_URL="https://graphql-pyxis.api.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "stage" ]]
+        then
+          PYXIS_URL="https://pyxis.preprod.api.redhat.com/"
+          PYXIS_GRAPHQL_URL="https://graphql-pyxis.preprod.api.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "production-internal" ]]
+        then
+          PYXIS_URL="https://pyxis.engineering.redhat.com/"
+          PYXIS_GRAPHQL_URL="https://graphql.pyxis.engineering.redhat.com/graphql/"
+        elif [[ "$(params.server)" == "stage-internal" ]]
+        then
+          PYXIS_URL="https://pyxis.stage.engineering.redhat.com/"
+          PYXIS_GRAPHQL_URL="https://graphql.pyxis.stage.engineering.redhat.com/graphql/"
+        else
+          echo "Invalid server parameter. Only 'production','production-internal,'stage-internal' and 'stage' allowed."
+          exit 1
+        fi
+
+        echo "🌐 MOCK: Would connect to Pyxis API: $PYXIS_URL"
+        echo "🌐 MOCK: Would connect to Pyxis GraphQL: $PYXIS_GRAPHQL_URL"
+        echo "🔐 MOCK: Would use secret: $(params.pyxisSecret) (but this is mocked)"
+        echo
+
+        SNAPSHOT_SPEC_FILE="$(params.dataDir)/$(params.snapshotPath)"
+        if [ ! -f "${SNAPSHOT_SPEC_FILE}" ] ; then
+            echo "No valid snapshot file was provided."
+            exit 1
+        fi
+
+        echo "📄 SNAPSHOT INPUT FILE:"
+        echo "==============================================="
+        cat "${SNAPSHOT_SPEC_FILE}" | jq '.'
+        echo "==============================================="
+        echo
+
+        DATA_FILE="$(params.dataDir)/$(params.dataPath)"
+        if [ ! -f "${DATA_FILE}" ] ; then
+            echo "No valid data file was provided."
+            exit 1
+        fi
+
+        echo "📄 DATA INPUT FILE:"
+        echo "==============================================="
+        cat "${DATA_FILE}" | jq '.'
+        echo "==============================================="
+        echo
+
+        # Create the output directory
+        OUTPUT_DIR=$(dirname "$(params.dataDir)/$(params.pyxisJsonPath)")
+        mkdir -p "$OUTPUT_DIR"
+
+        # Read components from snapshot
+        COMPONENTS=$(jq -r '.spec.components | length' "${SNAPSHOT_SPEC_FILE}")
+        echo "🔢 Processing $COMPONENTS components from snapshot"
+        echo
+
+        # Create the mock function to check if image is Helm chart
+        check_if_helm_chart() {
+            local container_image="$1"
+
+            echo "🔍 MOCK: Checking if $container_image is a Helm chart..."
+
+            # Mock the oras manifest fetch to simulate checking mediaType
+            if [[ "$container_image" == *"helm"* ]] || [[ "$container_image" == *"chart"* ]]; then
+                echo "🎭 MOCK: Simulated oras manifest fetch for $container_image"
+                echo "🎭 MOCK: Found config.mediaType: application/vnd.cncf.helm.config.v1+json"
+                return 0  # Is Helm chart
+            else
+                echo "🎭 MOCK: Simulated oras manifest fetch for $container_image"
+                echo "🎭 MOCK: Found config.mediaType: application/vnd.oci.image.config.v1+json"
+                return 1  # Is container image
+            fi
+        }
+
+        # Process each component and apply Helm chart filtering
+        JSON_OUTPUT='{"components": []}'
+
+        for (( i=0; i < COMPONENTS; i++ )); do
+            COMPONENT=$(jq -c --argjson i "$i" '.spec.components[$i]' "${SNAPSHOT_SPEC_FILE}")
+            COMPONENT_NAME=$(jq -r '.name' <<< "$COMPONENT")
+            CONTAINER_IMAGE=$(jq -r '.containerImage' <<< "$COMPONENT")
+
+            echo "🎯 Processing component $((i+1))/$COMPONENTS: $COMPONENT_NAME"
+            echo "🖼️  Container Image: $CONTAINER_IMAGE"
+
+            # Check if this is a Helm chart and skip if so
+            if check_if_helm_chart "$CONTAINER_IMAGE"; then
+                echo "⏭️  INFO: Skipping Helm chart component: $CONTAINER_IMAGE (not relevant for RPM processing)"
+                echo "✅ Helm chart filtered out successfully!"
+                echo
+                continue
+            fi
+
+            echo "✅ Processing container image component"
+
+            # Create mock Pyxis data for this component
+            COMPONENT_DATA=$(cat << EOF
+        {
+          "componentIndex": $i,
+          "containerImage": "$CONTAINER_IMAGE",
+          "pyxisImages": [
+            {
+              "imageId": "mock-image-id-$i",
+              "digest": "sha256:$(echo -n "$CONTAINER_IMAGE" | sha256sum | cut -d' ' -f1)",
+              "arch_digest": "sha256:$(echo -n "$CONTAINER_IMAGE-amd64" | sha256sum | cut -d' ' -f1)",
+              "os": "linux",
+              "arch": "amd64",
+              "registry": "$(echo "$CONTAINER_IMAGE" | cut -d'/' -f1)",
+              "repository": "$(echo "$CONTAINER_IMAGE" | cut -d'@' -f1 | cut -d'/' -f2-)"
+            }
+          ]
+        }
+        EOF
+            )
+
+            # Add this component to the output
+            JSON_OUTPUT=$(jq --argjson component_data "$COMPONENT_DATA" '.components += [$component_data]' <<< "$JSON_OUTPUT")
+
+            echo "🎭 MOCK: Would create Pyxis ContainerImage entry for: $CONTAINER_IMAGE"
+            echo "🎭 MOCK: Would assign imageId: mock-image-id-$i"
+            echo
+        done
+
+        # Write the final JSON output
+        PYXIS_OUTPUT_FILE="$(params.dataDir)/$(params.pyxisJsonPath)"
+        echo "$JSON_OUTPUT" | jq '.' > "$PYXIS_OUTPUT_FILE"
+
+        echo "📊 FINAL PYXIS OUTPUT (after Helm filtering):"
+        echo "==============================================="
+        cat "$PYXIS_OUTPUT_FILE" | jq '.'
+        echo "==============================================="
+        echo
+
+        FINAL_COMPONENT_COUNT=$(jq '.components | length' "$PYXIS_OUTPUT_FILE")
+        FILTERED_COUNT=$((COMPONENTS - FINAL_COMPONENT_COUNT))
+
+        echo "📈 FILTERING SUMMARY:"
+        echo "   - Original components: $COMPONENTS"
+        echo "   - Container images processed: $FINAL_COMPONENT_COUNT"
+        echo "   - Helm charts filtered out: $FILTERED_COUNT"
+        echo "   - Output file: $(params.pyxisJsonPath)"
+        echo
+
+        if [ $FILTERED_COUNT -gt 0 ]; then
+            echo "🎉 SUCCESS: Helm chart filtering working correctly!"
+            echo "🎉 Helm charts were detected and excluded from Pyxis processing"
+        else
+            echo "ℹ️  INFO: No Helm charts detected in this snapshot"
+        fi
+
+        echo "✅ Mock create-pyxis-image completed successfully!"
+
+        # Set the result for the task
+        printf "$(params.pyxisJsonPath)" > $(results.pyxisDataPath.path)
+    - name: create-trusted-artifact
+      computeResources:
+        limits:
+          memory: 64Mi
+        requests:
+          memory: 64Mi
+          cpu: 30m
+      ref:
+        resolver: "git"
+        params:
+          - name: url
+            value: $(params.taskGitUrl)
+          - name: revision
+            value: $(params.taskGitRevision)
+          - name: pathInRepo
+            value: stepactions/create-trusted-artifact/create-trusted-artifact.yaml
+      params:
+        - name: workDir
+          value: $(params.dataDir)
+        - name: ociStorage
+          value: $(params.ociStorage)
+        - name: sourceDataArtifact
+          value: $(results.sourceDataArtifact.path)
