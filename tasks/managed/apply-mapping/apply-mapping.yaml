@@ -119,7 +119,7 @@ spec:
         - name: sourceDataArtifact
           value: $(params.sourceDataArtifact)
     - name: apply-mapping
-      image: quay.io/konflux-ci/release-service-utils:a58dc96cb28b54cdef2564a346d43a6d7bd4d656
+      image: quay.io/yftacherzog/release-service-utils:parse-mediatype-simple
       computeResources:
         limits:
           memory: 64Mi
@@ -373,25 +373,32 @@ spec:
             arch="$(jq -rs 'map(.platform.architecture) | .[0]' <<< "$arch_json")"
             os="$(jq -rs 'map(.platform.os) | .[0]' <<< "$arch_json")"
 
-            # Try normal skopeo inspect first (common case: regular container images)
-            if image_metadata="$(skopeo inspect --retry-times 3 --no-tags --override-os "${os}" --override-arch \
-            "${arch}" docker://"${IMAGE_REF}" 2>/dev/null | jq -c)" && [[ -n "$image_metadata" ]]; then
-                # Successfully got image metadata - this is a regular container image
-                build_date="$(jq -r '.Labels."build-date" // .Created // ""' <<< "$image_metadata")"
-                oci_version_raw="$(jq -r '.annotations."org.opencontainers.image.version" // ""' <<< "$image_metadata")"
-            else
-                # Failed to get image metadata - try raw manifest (could be Helm chart or other artifact type)
-                echo "Standard skopeo inspect failed for ${NAME}, trying raw manifest (non-image artifact)"
+            # Get configMediaType from architecture info to determine artifact type
+            config_media_type="$(jq -rs '.[0].configMediaType' <<< "$arch_json")"
+
+            # Check if this is a Helm chart - handle Helm artifacts specifically
+            if [[ "$config_media_type" == "application/vnd.cncf.helm.config.v1+json" ]]; then
+                # This is a Helm chart - use raw manifest approach
+                echo "Detected Helm chart artifact for ${NAME}, using raw manifest"
                 raw_manifest="$(skopeo inspect --retry-times 3 --no-tags --raw docker://"${IMAGE_REF}" | jq -c)"
                 oci_version_raw="$(jq -r '.annotations."org.opencontainers.image.version" // ""' <<< "$raw_manifest")"
                 build_date="$(jq -r '.annotations."org.opencontainers.image.created" // ""' <<< "$raw_manifest")"
                 # Create minimal image_metadata for compatibility (empty if parsing fails)
                 image_metadata="$(jq -n --argjson annotations "$(jq '.annotations // {}' <<< "$raw_manifest")" \
                   '{"Labels": {}, "Created": "", "annotations": $annotations}' || echo '{}')"
+            else
+                # This is a regular container image - use standard skopeo inspect
+                image_metadata="$(skopeo inspect --retry-times 3 --no-tags --override-os "${os}" --override-arch "${arch}" \
+                  docker://"${IMAGE_REF}" | jq -c)"
+                # For timestamp, use Labels.build-date and fallback to Created
+                build_date="$(jq -r '.Labels."build-date" // .Created // ""' <<< "$image_metadata")"
+                oci_version_raw="$(jq -r '.annotations."org.opencontainers.image.version" // ""' <<< "$image_metadata")"
             fi
 
             # Transform version to OCI tag format: replace + with _ (convention for OCI compliance)
+            # Set default value if empty (common for regular container images without OCI annotations)
             oci_version="${oci_version_raw//+/_}"
+            oci_version="${oci_version:-unknown}"
 
             if [ "${build_date}" = "" ] ; then
               timestamp=""

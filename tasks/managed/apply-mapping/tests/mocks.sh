@@ -85,6 +85,15 @@ function skopeo() {
 }
 
 function get-image-architectures() {
-    echo '{"platform":{"architecture": "amd64", "os": "linux"}, "digest": "abcdefg"}'
-    echo '{"platform":{"architecture": "ppc64le", "os": "linux"}, "digest": "deadbeef"}'
+    # Enhanced get-image-architectures that includes configMediaType support
+    local image_ref="$1"
+
+    if [[ "$image_ref" == *"helm-chart"* ]]; then
+        # Return Helm chart format with configMediaType
+        echo '{"platform":{"architecture": "amd64", "os": "linux"}, "digest": "sha256:789abcdef123456", "multiarch": false, "configMediaType": "application/vnd.cncf.helm.config.v1+json"}'
+    else
+        # Return regular container image format with configMediaType
+        echo '{"platform":{"architecture": "amd64", "os": "linux"}, "digest": "abcdefg", "multiarch": false, "configMediaType": "application/vnd.oci.image.config.v1+json"}'
+        echo '{"platform":{"architecture": "ppc64le", "os": "linux"}, "digest": "deadbeef", "multiarch": false, "configMediaType": "application/vnd.oci.image.config.v1+json"}'
+    fi
 }
